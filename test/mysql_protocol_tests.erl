@@ -44,7 +44,8 @@ resultset_test() ->
     ExpectedCommunication = [{send, ExpectedReq},
                              {recv, ExpectedResponse}],
     Sock = mock_tcp:create(ExpectedCommunication),
-    {ok, [ResultSet]} = mysql_protocol:query(Query, mock_tcp, Sock, infinity),
+    {ok, [ResultSet]} = mysql_protocol:query(Query, mock_tcp, Sock, [],
+                                             no_filtermap_fun, infinity),
     mock_tcp:close(Sock),
     ?assertMatch(#resultset{cols = [#col{name = <<"@@version_comment">>}],
                             rows = [[<<"MySQL Community Server (GPL)">>]]},
@@ -81,7 +82,8 @@ resultset_error_test() ->
         "48 04 23 48 59 30 30 30    4e 6f 20 74 61 62 6c 65    H.#HY000No table"
         "73 20 75 73 65 64                                     s used"),
     Sock = mock_tcp:create([{send, ExpectedReq}, {recv, ExpectedResponse}]),
-    {ok, [Result]} = mysql_protocol:query(Query, mock_tcp, Sock, infinity),
+    {ok, [Result]} = mysql_protocol:query(Query, mock_tcp, Sock, [],
+                                          no_filtermap_fun, infinity),
     ?assertMatch(#error{}, Result),
     mock_tcp:close(Sock),
     ok.
@@ -116,7 +118,7 @@ bad_protocol_version_test() ->
     Sock = mock_tcp:create([{recv, <<2, 0, 0, 0, 9, 0>>}]),
     SSLOpts = undefined,
     ?assertError(unknown_protocol,
-                 mysql_protocol:handshake("foo", "bar", "db", mock_tcp,
+                 mysql_protocol:handshake("foo", "bar", "baz", "db", mock_tcp,
                                           SSLOpts, Sock, false)),
     mock_tcp:close(Sock).
 
@@ -129,7 +131,7 @@ error_as_initial_packet_test() ->
     Sock = mock_tcp:create([{recv, Packet}]),
     SSLOpts = undefined,
     ?assertMatch(#error{code = 1040, msg = <<"Too many connections">>},
-                 mysql_protocol:handshake("foo", "bar", "db", mock_tcp,
+                 mysql_protocol:handshake("foo", "bar", "baz", "db", mock_tcp,
                                           SSLOpts, Sock, false)),
     mock_tcp:close(Sock).
 

@@ -26,15 +26,18 @@
 -module(mysql).
 
 -export([start_link/1, stop/1, stop/2,
+         is_connected/1,
          query/2, query/3, query/4, query/5,
          execute/3, execute/4, execute/5,
          prepare/2, prepare/3, unprepare/2,
          warning_count/1, affected_rows/1, autocommit/1, insert_id/1,
          encode/2, in_transaction/1,
          transaction/2, transaction/3, transaction/4,
-         change_user/3, change_user/4]).
+         change_user/3, change_user/4, reset_connection/1]).
 
--export_type([connection/0, server_reason/0, query_result/0]).
+-export_type([option/0, connection/0, query/0, statement_name/0,
+              statement_ref/0, query_param/0, query_filtermap_fun/0,
+              query_result/0, transaction_result/1, server_reason/0]).
 
 %% A connection is a ServerRef as in gen_server:call/2,3.
 -type connection() :: Name :: atom() |
@@ -47,21 +50,49 @@
 -type server_reason() :: {Code :: integer(), SQLState :: binary() | undefined,
                           Message :: binary()}.
 
--type column_names() :: [binary()].
+-type column_name() :: binary().
+-type query() :: iodata().
 -type row() :: [term()].
--type rows() :: [row()].
+
+-type query_param() :: term().
 
 -type query_filtermap_fun() :: fun((row()) -> query_filtermap_res())
-                             | fun((column_names(), row()) -> query_filtermap_res()).
+                             | fun(([column_name()], row()) -> query_filtermap_res()).
 -type query_filtermap_res() :: boolean()
                              | {true, term()}.
 
+-type statement_id() :: integer().
+-type statement_name() :: atom().
+-type statement_ref() :: statement_id() | statement_name().
+
 -type query_result() :: ok
-                      | {ok, column_names(), rows()}
-                      | {ok, [{column_names(), rows()}, ...]}
+                      | {ok, [column_name()], [row()]}
+                      | {ok, [{[column_name()], [row()]}, ...]}
                       | {error, server_reason()}.
 
--define(default_connect_timeout, 5000).
+-type transaction_result(Result) :: {atomic, Result} | {aborted, Reason :: term()}.
+
+-type server_name() :: {local, Name :: atom()}
+                     | {global, GlobalName :: term()}
+                     | {via, Via :: module(), ViaName :: term()}.
+
+-type option() :: {name, ServerName :: server_name()}
+                | {host, inet:socket_address() | inet:hostname()} | {port, integer()}
+                | {user, iodata()} | {password, iodata()}
+                | {database, iodata()}
+                | {connect_mode, synchronous | asynchronous | lazy}
+                | {connect_timeout, timeout()}
+                | {allowed_local_paths, [binary()]}
+                | {log_warnings, boolean()}
+                | {log_slow_queries, boolean()}
+                | {keep_alive, boolean() | timeout()}
+                | {prepare, [{StatementName :: statement_name(), Statement :: query()}]}
+                | {queries, [query()]}
+                | {query_timeout, timeout()}
+                | {found_rows, boolean()}
+                | {query_cache_time, non_neg_integer()}
+                | {tcp_options, [gen_tcp:connect_option()]}
+                | {ssl, term()}.
 
 -include("exception.hrl").
 
@@ -88,11 +119,44 @@
 %%   <dt>`{database, Database}'</dt>
 %%   <dd>The name of the database AKA schema to use. This can be changed later
 %%       using the query `USE <database>'.</dd>
+%%   <dt>`{connect_mode, synchronous | asynchronous | lazy}'</dt>
+%%   <dd>Specifies how and when the connection process should establish a connection
+%%       to the MySQL server.
+%%       <dl>
+%%         <dt>`synchronous' (default)</dt>
+%%         <dd>The connection will be established as part of the connection process'
+%%             start routine, ie the returned connection process will already be
+%%             connected and ready to use, and any on-connect prepares and queries
+%%             will have been executed.</dd>
+%%         <dt>`asynchronous'</dt>
+%%         <dd>The connection process will be started and returned to the caller
+%%             before really establishing a connection to the server and executing
+%%             the on-connect prepares and executes. This will instead be done
+%%             immediately afterwards as the first action of the connection
+%%             process.</dd>
+%%         <dt>`lazy'</dt>
+%%         <dd>Similar to `asynchronous' mode, but an actual connection will be
+%%             established and the on-connect prepares and queries executed only
+%%             when a connection is needed for the first time, eg. to execute a
+%%             query.</dd>
+%%      </dl>
+%%   </dd>
 %%   <dt>`{connect_timeout, Timeout}'</dt>
 %%   <dd>The maximum time to spend for start_link/1.</dd>
+%%   <dt>`{allowed_local_paths, [binary()]}'</dt>
+%%   <dd>This option allows you to specify a list of directories or individual
+%%       files on the client machine which the server may request, for example
+%%       when executing a `LOAD DATA LOCAL INFILE' query. Only absolute paths
+%%       without relative components such as `..' and `.' are allowed.
+%%       The default is an empty list, meaning the client will not send any
+%%       local files to the server.</dd>
 %%   <dt>`{log_warnings, boolean()}'</dt>
 %%   <dd>Whether to fetch warnings and log them using error_logger; default
 %%       true.</dd>
+%%   <dt>`{log_slow_queries, boolean()}'</dt>
+%%   <dd>Whether to log slow queries using error_logger; default false. Queries
+%%       are flagged as slow by the server if their execution time exceeds the
+%%       value in the `long_query_time' variable.</dd>
 %%   <dt>`{keep_alive, boolean() | timeout()}'</dt>
 %%   <dd>Send ping when unused for a certain time. Possible values are `true',
 %%       `false' and `integer() > 0' for an explicit interval in milliseconds.
@@ -122,38 +186,22 @@
 %%       `{recbuf, Size}' and `{sndbuf, Size}' if you send or receive more than
 %%       the default (typically 8K) per query.</dd>
 %%   <dt>`{ssl, Options}'</dt>
-%%   <dd>Additional options for `ssl:connect/3'.</dd>
+%%   <dd>Additional options for `ssl:connect/3'.<br />
+%%       The `verify' option, if not given explicitly, defaults to
+%%       `verify_peer'.<br />
+%%       The `server_name_indication' option, if omitted, defaults to the value
+%%       of the `host' option if it is a hostname string, otherwise no default
+%%       value is set.</dd>
 %% </dl>
--spec start_link(Options) -> {ok, pid()} | ignore | {error, term()}
-    when Options :: [Option],
-         Option :: {name, ServerName} |
-                   {host, inet:socket_address() | inet:hostname()} | {port, integer()} |
-                   {user, iodata()} | {password, iodata()} |
-                   {database, iodata()} |
-                   {connect_timeout, timeout()} |
-                   {log_warnings, boolean()} |
-                   {keep_alive, boolean() | timeout()} |
-                   {prepare, NamedStatements} |
-                   {queries, [iodata()]} |
-                   {query_timeout, timeout()} |
-                   {found_rows, boolean()} |
-                   {query_cache_time, non_neg_integer()} |
-                   {tcp_options, [gen_tcp:connect_option()]} |
-                   {ssl, term()},
-         ServerName :: {local, Name :: atom()} |
-                       {global, GlobalName :: term()} |
-                       {via, Module :: atom(), ViaName :: term()},
-         NamedStatements :: [{StatementName :: atom(), Statement :: iodata()}].
+-spec start_link(Options :: [option()]) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Options) ->
-    GenSrvOpts = [{timeout, proplists:get_value(connect_timeout, Options,
-                                                ?default_connect_timeout)}],
     case proplists:get_value(name, Options) of
         undefined ->
-            gen_server:start_link(mysql_conn, Options, GenSrvOpts);
+            gen_server:start_link(mysql_conn, Options, []);
         ServerName ->
-            gen_server:start_link(ServerName, mysql_conn, Options, GenSrvOpts)
+            gen_server:start_link(ServerName, mysql_conn, Options, [])
     end.
- 
+
 %% @see stop/2.
 -spec stop(Conn) -> ok
     when Conn :: connection().
@@ -198,108 +246,127 @@ backported_gen_server_stop(Conn, Reason, Timeout) ->
         end
     end.
 
+%% @private
+-spec is_connected(Conn) -> boolean()
+    when Conn :: connection().
+is_connected(Conn) ->
+    gen_server:call(Conn, is_connected).
 
+%% @doc Executes a plain query.
 %% @see query/5.
 -spec query(Conn, Query) -> Result
     when Conn :: connection(),
          Query :: iodata(),
          Result :: query_result().
 query(Conn, Query) ->
-    query(Conn, Query, no_params, no_filtermap_fun, default_timeout).
+    query_helper(Conn, Query, no_params, no_filtermap_fun, default_timeout).
 
+%% @doc Executes a query.
 %% @see query/5.
 -spec query(Conn, Query, Params | FilterMap | Timeout) -> Result
     when Conn :: connection(),
-         Query :: iodata(),
-         Timeout :: default_timeout | timeout(),
-         Params :: no_params | [term()],
-         FilterMap :: no_filtermap_fun | query_filtermap_fun(),
+         Query :: query(),
+         Timeout :: timeout(),
+         Params :: [query_param()],
+         FilterMap :: query_filtermap_fun(),
          Result :: query_result().
 query(Conn, Query, Params) when Params == no_params;
                                 is_list(Params) ->
-    query(Conn, Query, Params, no_filtermap_fun, default_timeout);
+    query_helper(Conn, Query, Params, no_filtermap_fun, default_timeout);
 query(Conn, Query, FilterMap) when FilterMap == no_filtermap_fun;
                                    is_function(FilterMap, 1);
                                    is_function(FilterMap, 2) ->
-    query(Conn, Query, no_params, FilterMap, default_timeout);
+    query_helper(Conn, Query, no_params, FilterMap, default_timeout);
 query(Conn, Query, Timeout) when Timeout == default_timeout;
                                  is_integer(Timeout);
                                  Timeout == infinity ->
-    query(Conn, Query, no_params, no_filtermap_fun, Timeout).
+    query_helper(Conn, Query, no_params, no_filtermap_fun, Timeout).
 
+%% @doc Executes a query.
 %% @see query/5.
 -spec query(Conn, Query, Params, Timeout) -> Result
         when Conn :: connection(),
-             Query :: iodata(),
-             Timeout :: default_timeout | timeout(),
-             Params :: no_params | [term()],
+             Query :: query(),
+             Timeout :: timeout(),
+             Params :: [query_param()],
              Result :: query_result();
     (Conn, Query, FilterMap, Timeout) -> Result
         when Conn :: connection(),
-             Query :: iodata(),
-             Timeout :: default_timeout | timeout(),
-             FilterMap :: no_filtermap_fun | query_filtermap_fun(),
+             Query :: query(),
+             Timeout :: timeout(),
+             FilterMap :: query_filtermap_fun(),
              Result :: query_result();
     (Conn, Query, Params, FilterMap) -> Result
         when Conn :: connection(),
-             Query :: iodata(),
-             Params :: no_params | [term()],
-             FilterMap :: no_filtermap_fun | query_filtermap_fun(),
+             Query :: query(),
+             Params :: [query_param()],
+             FilterMap :: query_filtermap_fun(),
              Result :: query_result().
 query(Conn, Query, Params, Timeout) when (Params == no_params orelse
                                           is_list(Params)) andalso
                                          (Timeout == default_timeout orelse
                                           is_integer(Timeout) orelse
                                           Timeout == infinity) ->
-    query(Conn, Query, Params, no_filtermap_fun, Timeout);
+    query_helper(Conn, Query, Params, no_filtermap_fun, Timeout);
 query(Conn, Query, FilterMap, Timeout) when (FilterMap == no_filtermap_fun orelse
                                              is_function(FilterMap, 1) orelse
                                              is_function(FilterMap, 2)) andalso
                                             (Timeout == default_timeout orelse
                                              is_integer(Timeout) orelse
                                              Timeout=:=infinity) ->
-    query(Conn, Query, no_params, FilterMap, Timeout);
+    query_helper(Conn, Query, no_params, FilterMap, Timeout);
 query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
                                             is_list(Params)) andalso
                                            (FilterMap == no_filtermap_fun orelse
                                             is_function(FilterMap, 1) orelse
                                             is_function(FilterMap, 2)) ->
-    query(Conn, Query, Params, FilterMap, default_timeout).
+    query_helper(Conn, Query, Params, FilterMap, default_timeout).
 
-%% @doc Executes a parameterized query with a timeout and applies a filter/map
-%% function to the result rows.
+%% @doc Executes a query.
 %%
-%% A prepared statement is created, executed and then cached for a certain
-%% time. If the same query is executed again when it is already cached, it does
-%% not need to be prepared again.
+%% === Parameters ===
 %%
-%% The minimum time the prepared statement is cached can be specified using the
-%% option `{query_cache_time, Milliseconds}' to start_link/1.
+%% `Conn' is identifying a connection process started using
+%% `mysql:start_link/1'.
+%%
+%% `Query' is the query to execute, as a binary or a list.
+%%
+%% `Params', `FilterMap' and `Timeout' are optional.
+%%
+%% If `Params' (a list) is specified, the query is performed as a prepared
+%% statement. A prepared statement is created, executed and then cached for a
+%% certain time (specified using the option `{query_cache_time, Milliseconds}'
+%% to `start_link/1'). If the same query is executed again during this time,
+%% it does not need to be prepared again. If `Params' is omitted, the query
+%% is executed as a plain query. To force a query without parameters to be
+%% executed as a prepared statement, an empty list can be used for `Params'.
+%%
+%% If `FilterMap' (a fun) is specified, the function is applied to each row to
+%% filter or perform other actions on the rows, in a way similar to how
+%% `lists:filtermap/2' works, before the result is returned to the caller. See
+%% below for details.
+%%
+%% `Timeout' specifies the time to wait for a response from the database. If
+%% omitted, the timeout given in `start_link/1' is used.
+%%
+%% === Return value ===
 %%
 %% Results are returned in the form `{ok, ColumnNames, Rows}' if there is one
 %% result set. If there are more than one result sets, they are returned in the
-%% form `{ok, [{ColumnNames, Rows}, ...]}'.
+%% form `{ok, [{ColumnNames, Rows}, ...]}'. This is typically the case if
+%% multiple queries are specified at the same time, separated by semicolons.
 %%
 %% For queries that don't return any rows (INSERT, UPDATE, etc.) only the atom
 %% `ok' is returned.
 %%
-%% The `Params', `FilterMap' and `Timeout' arguments are optional.
-%% <ul>
-%%   <li>If the `Params' argument is the atom `no_params' or is omitted, a plain
-%%       query will be executed instead of a parameterized one.</li>
-%%   <li>If the `FilterMap' argument is the atom `no_filtermap_fun' or is
-%%       omitted, no row filtering/mapping will be applied and all result rows
-%%       will be returned unchanged.</li>
-%%   <li>If the `Timeout' argument is the atom `default_timeout' or is omitted,
-%%       the timeout given in `start_link/1' is used.</li>
-%% </ul>
+%% === FilterMap details ===
 %%
 %% If the `FilterMap' argument is used, it must be a function of arity 1 or 2
 %% that returns either `true', `false', or `{true, Value}'.
 %%
 %% Each result row is handed to the given function as soon as it is received
 %% from the server, and only when the function has returned, the next row is
-%% fetched. This provides the ability to prevent memory exhaustion; on the
+%% fetched. This provides the ability to prevent memory exhaustion. On the
 %% other hand, it can cause the server to time out on sending if your function
 %% is doing something slow (see the MySQL documentation on `NET_WRITE_TIMEOUT').
 %%
@@ -312,6 +379,8 @@ query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
 %% else is to be included in the result instead (mapping). You may also use
 %% this function for side effects, like writing rows to disk or sending them
 %% to another process etc.
+%%
+%% === Examples ===
 %%
 %% Here is an example showing some of the things that are possible:
 %% ```
@@ -343,18 +412,28 @@ query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
 %%     (_) ->
 %%         false
 %% end,
-%% query(Conn, Query, no_params, FilterMap, default_timeout).
+%% query(Conn, Query, FilterMap).
 %% '''
 -spec query(Conn, Query, Params, FilterMap, Timeout) -> Result
     when Conn :: connection(),
-         Query :: iodata(),
+         Query :: query(),
+         Timeout :: timeout(),
+         Params :: [query_param()],
+         FilterMap :: query_filtermap_fun(),
+         Result :: query_result().
+query(Conn, Query, Params, FilterMap, Timeout) ->
+    query_helper(Conn, Query, Params, FilterMap, Timeout).
+
+-spec query_helper(Conn, Query, Params, FilterMap, Timeout) -> Result
+    when Conn :: connection(),
+         Query :: query(),
          Timeout :: default_timeout | timeout(),
-         Params :: no_params | [term()],
+         Params :: no_params | [query_param()],
          FilterMap :: no_filtermap_fun | query_filtermap_fun(),
          Result :: query_result().
-query(Conn, Query, no_params, FilterMap, Timeout) ->
+query_helper(Conn, Query, no_params, FilterMap, Timeout) ->
     query_call(Conn, {query, Query, FilterMap, Timeout});
-query(Conn, Query, Params, FilterMap, Timeout) ->
+query_helper(Conn, Query, Params, FilterMap, Timeout) ->
     case mysql_protocol:valid_params(Params) of
         true ->
             query_call(Conn,
@@ -371,11 +450,11 @@ query(Conn, Query, Params, FilterMap, Timeout) ->
 %% @see execute/5
 -spec execute(Conn, StatementRef, Params) -> Result | {error, not_prepared}
   when Conn :: connection(),
-       StatementRef :: atom() | integer(),
-       Params :: [term()],
+       StatementRef :: statement_ref(),
+       Params :: [query_param()],
        Result :: query_result().
 execute(Conn, StatementRef, Params) ->
-    execute(Conn, StatementRef, Params, no_filtermap_fun, default_timeout).
+    execute_helper(Conn, StatementRef, Params, no_filtermap_fun, default_timeout).
 
 %% @doc Executes a prepared statement.
 %% @see prepare/2
@@ -385,22 +464,22 @@ execute(Conn, StatementRef, Params) ->
 -spec execute(Conn, StatementRef, Params, FilterMap | Timeout) ->
     Result | {error, not_prepared}
   when Conn :: connection(),
-       StatementRef :: atom() | integer(),
-       Params :: [term()],
-       FilterMap :: no_filtermap_fun | query_filtermap_fun(),
-       Timeout :: default_timeout | timeout(),
+       StatementRef :: statement_ref(),
+       Params :: [query_param()],
+       FilterMap :: query_filtermap_fun(),
+       Timeout :: timeout(),
        Result :: query_result().
 execute(Conn, StatementRef, Params, Timeout) when Timeout == default_timeout;
                                                   is_integer(Timeout);
                                                   Timeout=:=infinity ->
-    execute(Conn, StatementRef, Params, no_filtermap_fun, Timeout);
+    execute_helper(Conn, StatementRef, Params, no_filtermap_fun, Timeout);
 execute(Conn, StatementRef, Params, FilterMap) when FilterMap == no_filtermap_fun;
                                                     is_function(FilterMap, 1);
                                                     is_function(FilterMap, 2) ->
-    execute(Conn, StatementRef, Params, FilterMap, default_timeout).
+    execute_helper(Conn, StatementRef, Params, FilterMap, default_timeout).
 
 %% @doc Executes a prepared statement.
-%% 
+%%
 %% The `FilterMap' and `Timeout' arguments are optional.
 %% <ul>
 %%   <li>If the `FilterMap' argument is the atom `no_filtermap_fun' or is
@@ -419,12 +498,23 @@ execute(Conn, StatementRef, Params, FilterMap) when FilterMap == no_filtermap_fu
 -spec execute(Conn, StatementRef, Params, FilterMap, Timeout) ->
     Result | {error, not_prepared}
   when Conn :: connection(),
-       StatementRef :: atom() | integer(),
-       Params :: [term()],
+       StatementRef :: statement_ref(),
+       Params :: [query_param()],
+       FilterMap :: query_filtermap_fun(),
+       Timeout :: timeout(),
+       Result :: query_result().
+execute(Conn, StatementRef, Params, FilterMap, Timeout) ->
+    execute_helper(Conn, StatementRef, Params, FilterMap, Timeout).
+
+-spec execute_helper(Conn, StatementRef, Params, FilterMap, Timeout) ->
+    Result | {error, not_prepared}
+  when Conn :: connection(),
+       StatementRef :: statement_ref(),
+       Params :: [query_param()],
        FilterMap :: no_filtermap_fun | query_filtermap_fun(),
        Timeout :: default_timeout | timeout(),
        Result :: query_result().
-execute(Conn, StatementRef, Params, FilterMap, Timeout) ->
+execute_helper(Conn, StatementRef, Params, FilterMap, Timeout) ->
     case mysql_protocol:valid_params(Params) of
         true ->
             query_call(Conn,
@@ -437,8 +527,8 @@ execute(Conn, StatementRef, Params, FilterMap, Timeout) ->
 %% @see prepare/3
 -spec prepare(Conn, Query) -> {ok, StatementId} | {error, Reason}
   when Conn :: connection(),
-       Query :: iodata(),
-       StatementId :: integer(),
+       Query :: query(),
+       StatementId :: statement_id(),
        Reason :: server_reason().
 prepare(Conn, Query) ->
     gen_server:call(Conn, {prepare, Query}).
@@ -448,8 +538,8 @@ prepare(Conn, Query) ->
 %% @see prepare/2
 -spec prepare(Conn, Name, Query) -> {ok, Name} | {error, Reason}
   when Conn :: connection(),
-       Name :: atom(),
-       Query :: iodata(),
+       Name :: statement_name(),
+       Query :: query(),
        Reason :: server_reason().
 prepare(Conn, Name, Query) ->
     gen_server:call(Conn, {prepare, Name, Query}).
@@ -457,7 +547,7 @@ prepare(Conn, Name, Query) ->
 %% @doc Deallocates a prepared statement.
 -spec unprepare(Conn, StatementRef) -> ok | {error, Reason}
   when Conn :: connection(),
-       StatementRef :: atom() | integer(),
+       StatementRef :: statement_ref(),
        Reason :: server_reason() | not_prepared.
 unprepare(Conn, StatementRef) ->
     gen_server:call(Conn, {unprepare, StatementRef}).
@@ -497,15 +587,20 @@ in_transaction(Conn) ->
 
 %% @doc This function executes the functional object Fun as a transaction.
 %% @see transaction/4
--spec transaction(connection(), fun()) -> {atomic, term()} | {aborted, term()}.
+-spec transaction(Conn, TransactionFun) -> TransactionResult
+    when Conn :: connection(),
+         TransactionFun :: fun(() -> Result),
+         TransactionResult :: transaction_result(Result).
 transaction(Conn, Fun) ->
     transaction(Conn, Fun, [], infinity).
 
 %% @doc This function executes the functional object Fun as a transaction.
 %% @see transaction/4
--spec transaction(connection(), fun(), Retries) -> {atomic, term()} |
-                                                   {aborted, term()}
-    when Retries :: non_neg_integer() | infinity.
+-spec transaction(Conn, TransactionFun, Retries) -> TransactionResult
+    when Conn :: connection(),
+         TransactionFun :: fun(() -> Result),
+         Retries :: non_neg_integer() | infinity,
+         TransactionResult :: transaction_result(Result).
 transaction(Conn, Fun, Retries) ->
     transaction(Conn, Fun, [], Retries).
 
@@ -553,9 +648,12 @@ transaction(Conn, Fun, Retries) ->
 %%     <tr><td>`throw(Term)'</td><td>`{aborted, {throw, Term}}'</td></tr>
 %%   </tbody>
 %% </table>
--spec transaction(connection(), fun(), list(), Retries) -> {atomic, term()} |
-                                                           {aborted, term()}
-    when Retries :: non_neg_integer() | infinity.
+-spec transaction(Conn, TransactionFun, Args, Retries) -> TransactionResult
+    when Conn :: connection(),
+         TransactionFun :: fun((...) -> Result),
+         Args :: list(),
+         Retries :: non_neg_integer() | infinity,
+         TransactionResult :: transaction_result(Result).
 transaction(Conn, Fun, Args, Retries) when is_list(Args),
                                            is_function(Fun, length(Args)) ->
     %% The guard makes sure that we can apply Fun to Args. Any error we catch
@@ -574,6 +672,11 @@ transaction(Conn, Fun, Args, Retries) when is_list(Args),
 %% rollback does not cancel that statement."
 %% (https://dev.mysql.com/doc/refman/5.6/en/innodb-error-handling.html)
 %%
+%% This seems to have changed in MySQL 5.7.x though (although the MySQL
+%% documentation hasn't been updated). Now, also the BEGIN is cancelled, so a
+%% new BEGIN has to be issued when restarting the transaction. This has no
+%% effect on older versions, not even a warning.
+%%
 %% Lock Wait Timeout:
 %% "InnoDB rolls back only the last statement on a transaction timeout by
 %% default. If --innodb_rollback_on_timeout is specified, a transaction timeout
@@ -590,15 +693,23 @@ execute_transaction(Conn, Fun, Args, Retries) ->
         %% retries left
         ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
           when Retries == infinity ->
+            %% In MySQL < 5.7 we're not in a transaction here, but in earlier
+            %% versions we are, so we can't use `gen_server:call(Conn,
+            %% start_transaction, infinity)' here.
+            ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, infinity);
         ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
           when Retries > 0 ->
+            ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, Retries - 1);
         ?EXCEPTION(throw, {implicit_rollback, 1, Reason}, Stacktrace)
           when Retries == 0 ->
             %% No more retries. Return 'aborted' along with the deadlock error
             %% and a the trace to the line where the deadlock occured.
             Trace = ?GET_STACK(Stacktrace),
+            %% In MySQL < 5.7, we are still in a transaction here, but in 5.7+
+            %% we're not.  The ROLLBACK executed here has no effect if no
+            %% transaction is ongoing.
             ok = gen_server:call(Conn, rollback, infinity),
             {aborted, {Reason, Trace}};
         ?EXCEPTION(throw, {implicit_rollback, N, Reason}, Stacktrace)
@@ -616,6 +727,12 @@ execute_transaction(Conn, Fun, Args, Retries) ->
             erlang:raise(error, E, ?GET_STACK(Stacktrace));
         ?EXCEPTION(error, change_user_in_transaction = E, Stacktrace) ->
             %% The called tried to change user inside the transaction, which
+            %% is not allowed and a serious mistake. We roll back and raise
+            %% an error.
+            ok = gen_server:call(Conn, rollback, infinity),
+            erlang:raise(error, E, ?GET_STACK(Stacktrace));
+        ?EXCEPTION(error, reset_connection_in_transaction = E, Stacktrace) ->
+            %% The called tried to reset connection inside the transaction, which
             %% is not allowed and a serious mistake. We roll back and raise
             %% an error.
             ok = gen_server:call(Conn, rollback, infinity),
@@ -671,15 +788,25 @@ change_user(Conn, Username, Password) ->
          Options :: [Option],
          Result :: ok,
          Option :: {database, iodata()}
-                 | {queries, [iodata()]}
+                 | {queries, [query()]}
                  | {prepare, [NamedStatement]},
-         NamedStatement :: {StatementName :: atom(), Statement :: iodata()}.
+         NamedStatement :: {StatementName :: statement_name(), Statement :: query()}.
 change_user(Conn, Username, Password, Options) ->
     case in_transaction(Conn) of
         true -> error(change_user_in_transaction);
         false -> ok
     end,
     gen_server:call(Conn, {change_user, Username, Password, Options}).
+
+-spec reset_connection(Conn) -> ok | {error, Reason}
+    when Conn :: connection(),
+         Reason :: server_reason().
+reset_connection(Conn) ->
+    case in_transaction(Conn) of
+        true -> error(reset_connection_in_transaction);
+        false -> ok
+    end,
+    gen_server:call(Conn, reset_connection).
 
 %% @doc Encodes a term as a MySQL literal so that it can be used to inside a
 %% query. If backslash escapes are enabled, backslashes and single quotes in

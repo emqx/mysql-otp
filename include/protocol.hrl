@@ -19,7 +19,9 @@
 %% Response packet tag (first byte)
 -define(OK, 0).
 -define(EOF, 16#fe).
+-define(MORE_DATA, 16#01).
 -define(ERROR, 16#ff).
+-define(LOCAL_INFILE_REQUEST, 16#fb).
 
 %% Character sets
 -define(UTF8MB3, 16#21). %% utf8_general_ci
@@ -27,12 +29,20 @@
 
 %% --- Capability flags ---
 
+%% Use the improved version of Old Password Authentication.
+%% Assumed to be set since 4.1.1.
+-define(CLIENT_LONG_PASSWORD, 16#00000001).
+
 %% Server: sends found rows instead of affected rows in EOF_Packet
 -define(CLIENT_FOUND_ROWS, 16#00000002).
 
 %% Server: supports schema-name in Handshake Response Packet
 %% Client: Handshake Response Packet contains a schema-name
 -define(CLIENT_CONNECT_WITH_DB, 16#00000008).
+
+%% Server: Enables the LOCAL INFILE request of LOAD DATA|XML
+%% Client: Will handle LOCAL INFILE request
+-define(CLIENT_LOCAL_FILES, 16#00000080).
 
 %% Server: supports the 4.1 protocol
 %% Client: uses the 4.1 protocol
@@ -101,6 +111,7 @@
 -define(COM_STMT_RESET, 16#1a).
 -define(COM_SET_OPTION, 16#1b).
 -define(COM_STMT_FETCH, 16#1c).
+-define(COM_RESET_CONNECTION, 16#1f).
 
 %% --- Types ---
 

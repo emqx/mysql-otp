@@ -45,12 +45,59 @@
                           "  c CHAR(2)"
                           ") ENGINE=InnoDB">>).
 
+connect_synchronous_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, synchronous}]),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
+connect_asynchronous_successful_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, asynchronous}]),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
+connect_asynchronous_failing_test() ->
+    process_flag(trap_exit, true),
+    {ok, Ret, _Logged} = error_logger_acc:capture(
+        fun () ->
+            {ok, Pid} = mysql:start_link([{user, "dummy"}, {password, "junk"},
+                                          {connect_mode, asynchronous}]),
+            receive
+                {'EXIT', Pid, {error, Error}} ->
+                    true = is_access_denied(Error),
+                    ok
+            after 1000 ->
+                error(no_exit_message)
+            end
+        end
+    ),
+    ?assertEqual(ok, Ret),
+    process_flag(trap_exit, false),
+    ok.
+
+connect_lazy_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {connect_mode, lazy}]),
+    ?assertNot(mysql:is_connected(Pid)),
+    {ok, [<<"1">>], [[1]]} = mysql:query(Pid, <<"SELECT 1">>),
+    ?assert(mysql:is_connected(Pid)),
+    mysql:stop(Pid),
+    ok.
+
 failing_connect_test() ->
     process_flag(trap_exit, true),
-    ?assertMatch({error, {1045, <<"28000">>, <<"Access denied", _/binary>>}},
-                 mysql:start_link([{user, "dummy"}, {password, "junk"}])),
+    {ok, Ret, Logged} = error_logger_acc:capture(
+        fun () ->
+            mysql:start_link([{user, "dummy"}, {password, "junk"}])
+        end),
+    ?assertMatch([_|_], Logged), % some errors logged
+    {error, Error} = Ret,
+    true = is_access_denied(Error),
     receive
-        {'EXIT', _Pid, {1045, <<"28000">>, <<"Access denie", _/binary>>}} -> ok
+        {'EXIT', _Pid, Error} -> ok
     after 1000 ->
         error(no_exit_message)
     end,
@@ -108,23 +155,17 @@ server_disconnect_test() ->
     process_flag(trap_exit, true),
     Options = [{user, ?user}, {password, ?password}],
     {ok, Pid} = mysql:start_link(Options),
-    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+    {ok, ok, _LoggedErrors} = error_logger_acc:capture(fun () ->
         %% Make the server close the connection after 1 second of inactivity.
         ok = mysql:query(Pid, <<"SET SESSION wait_timeout = 1">>),
         receive
-            {'EXIT', Pid, tcp_closed} -> ok
+            {'EXIT', Pid, normal} -> ok
         after 2000 ->
             no_exit_message
         end
     end),
     process_flag(trap_exit, false),
-    %% Check that we got the expected errors in the error log.
-    [{error, Msg1}, {error, Msg2}, {error_report, CrashReport}] = LoggedErrors,
-    %% "Connection Id 24 closing with reason: tcp_closed"
-    ?assert(lists:prefix("Connection Id", Msg1)),
-    ExpectedPrefix = io_lib:format("** Generic server ~p terminating", [Pid]),
-    ?assert(lists:prefix(lists:flatten(ExpectedPrefix), Msg2)),
-    ?assertMatch({crash_report, _}, CrashReport).
+    ?assertExit(noproc, mysql:stop(Pid)).
 
 tcp_error_test() ->
     process_flag(trap_exit, true),
@@ -156,7 +197,7 @@ keep_alive_test() ->
      receive after 70 -> ok end,
      State = get_state(Pid),
      [state, _Version, _ConnectionId, Socket | _] = tuple_to_list(State),
-     {ok, ExitMessage, LoggedErrors} = error_logger_acc:capture(fun () ->
+     {ok, ExitMessage, _LoggedErrors} = error_logger_acc:capture(fun () ->
          gen_tcp:close(Socket),
          receive
             Message -> Message
@@ -165,13 +206,27 @@ keep_alive_test() ->
          end
      end),
      process_flag(trap_exit, false),
-     %% Check that we got the expected crash report in the error log.
      ?assertMatch({'EXIT', Pid, _Reason}, ExitMessage),
-     [{error, LoggedMsg}, {error_report, LoggedReport}] = LoggedErrors,
-     ExpectedPrefix = io_lib:format("** Generic server ~p terminating", [Pid]),
-     ?assert(lists:prefix(lists:flatten(ExpectedPrefix), LoggedMsg)),
-     ?assertMatch({crash_report, _}, LoggedReport),
      ?assertExit(noproc, mysql:stop(Pid)).
+
+reset_connection_test() ->
+    %% Ignored test with MySQL earlier than 5.7
+    Options = [{user, ?user}, {password, ?password}, {keep_alive, true}],
+    {ok, Pid} = mysql:start_link(Options),
+    ok = mysql:query(Pid, <<"CREATE DATABASE otptest">>),
+    ok = mysql:query(Pid, <<"USE otptest">>),
+    ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+    ok = mysql:query(Pid, ?create_table_t),
+    ok = mysql:query(Pid, <<"INSERT INTO t (id, tx) VALUES (1, 'text 1')">>),
+    ?assertEqual(1, mysql:insert_id(Pid)),  %% auto_increment starts from 1
+    case mysql:reset_connection(Pid) of
+      ok ->
+        ?assertEqual(0, mysql:insert_id(Pid)); %% insertid reset to 0;
+      _Error ->
+        ?assertEqual(1, mysql:insert_id(Pid)) %% reset failed
+    end,
+    mysql:stop(Pid),
+    ok.
 
 unix_socket_test() ->
     try
@@ -205,11 +260,16 @@ unix_socket_test() ->
             error_logger:info_msg("Skipping unix socket tests. Current OTP "
                                   "release could not be determined.~n")
     end.
-    
+
 connect_queries_failure_test() ->
     process_flag(trap_exit, true),
-    {error, Reason} = mysql:start_link([{user, ?user}, {password, ?password},
-                                        {queries, ["foo"]}]),
+    {ok, Ret, Logged} = error_logger_acc:capture(
+        fun () ->
+            mysql:start_link([{user, ?user}, {password, ?password},
+                              {queries, ["foo"]}])
+        end),
+    ?assertMatch([{error_report, {crash_report, _}}], Logged),
+    {error, Reason} = Ret,
     receive
         {'EXIT', _Pid, Reason} -> ok
     after 1000 ->
@@ -219,8 +279,14 @@ connect_queries_failure_test() ->
 
 connect_prepare_failure_test() ->
     process_flag(trap_exit, true),
-    {error, Reason} = mysql:start_link([{user, ?user}, {password, ?password},
-                                        {prepare, [{foo, "foo"}]}]),
+    {ok, Ret, Logged} = error_logger_acc:capture(
+        fun () ->
+            mysql:start_link([{user, ?user}, {password, ?password},
+                                                {prepare, [{foo, "foo"}]}])
+        end),
+    ?assertMatch([{error_report, {crash_report, _}}], Logged),
+    {error, Reason} = Ret,
+    ?assertMatch({1064, <<"42000">>, <<"You have an erro", _/binary>>}, Reason),
     receive
         {'EXIT', _Pid, Reason} -> ok
     after 1000 ->
@@ -251,25 +317,55 @@ query_test_() ->
          mysql:stop(Pid)
      end,
      fun (Pid) ->
-         [{"Select db on connect", fun () -> connect_with_db(Pid) end},
-          {"Autocommit",           fun () -> autocommit(Pid) end},
-          {"Encode",               fun () -> encode(Pid) end},
-          {"Basic queries",        fun () -> basic_queries(Pid) end},
-          {"Filtermap queries",    fun () -> filtermap_queries(Pid) end},
-          {"FOUND_ROWS option",    fun () -> found_rows(Pid) end},
-          {"Multi statements",     fun () -> multi_statements(Pid) end},
-          {"Text protocol",        fun () -> text_protocol(Pid) end},
-          {"Binary protocol",      fun () -> binary_protocol(Pid) end},
-          {"FLOAT rounding",       fun () -> float_rounding(Pid) end},
-          {"DECIMAL",              fun () -> decimal(Pid) end},
-          {"INT",                  fun () -> int(Pid) end},
-          {"BIT(N)",               fun () -> bit(Pid) end},
-          {"DATE",                 fun () -> date(Pid) end},
-          {"TIME",                 fun () -> time(Pid) end},
-          {"DATETIME",             fun () -> datetime(Pid) end},
-          {"JSON",                 fun () -> json(Pid) end},
-          {"Microseconds",         fun () -> microseconds(Pid) end},
-          {"Invalid params",       fun () -> invalid_params(Pid) end}]
+         [{"Select db on connect",  fun () -> connect_with_db(Pid) end},
+          {"Autocommit",            fun () -> autocommit(Pid) end},
+          {"Encode",                fun () -> encode(Pid) end},
+          {"Basic queries",         fun () -> basic_queries(Pid) end},
+          {"Filtermap queries",     fun () -> filtermap_queries(Pid) end},
+          {"FOUND_ROWS option",     fun () -> found_rows(Pid) end},
+          {"Multi statements",      fun () -> multi_statements(Pid) end},
+          {"Text protocol",         fun () -> text_protocol(Pid) end},
+          {"Binary protocol",       fun () -> binary_protocol(Pid) end},
+          {"FLOAT rounding",        fun () -> float_rounding(Pid) end},
+          {"DECIMAL",               fun () -> decimal(Pid) end},
+          {"INT",                   fun () -> int(Pid) end},
+          {"BIT(N)",                fun () -> bit(Pid) end},
+          {"DATE",                  fun () -> date(Pid) end},
+          {"TIME",                  fun () -> time(Pid) end},
+          {"DATETIME",              fun () -> datetime(Pid) end},
+          {"JSON",                  fun () -> json(Pid) end},
+          {"Microseconds",          fun () -> microseconds(Pid) end},
+          {"Invalid params",        fun () -> invalid_params(Pid) end}]
+     end}.
+
+local_files_test_() ->
+    {setup,
+     fun () ->
+         {ok, Cwd0} = file:get_cwd(),
+         Cwd1 = iolist_to_binary(Cwd0),
+         Cwd2 = case binary:last(Cwd1) of
+             $/ -> Cwd1;
+             _ -> <<Cwd1/binary, $/>>
+         end,
+         {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                       {log_warnings, false},
+                                       {keep_alive, true}, {allowed_local_paths, [Cwd2]}]),
+         ok = mysql:query(Pid, <<"DROP DATABASE IF EXISTS otptest">>),
+         ok = mysql:query(Pid, <<"CREATE DATABASE otptest">>),
+         ok = mysql:query(Pid, <<"USE otptest">>),
+         ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+         ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
+         {Pid, Cwd2}
+     end,
+     fun ({Pid, _Cwd}) ->
+         ok = mysql:query(Pid, <<"DROP DATABASE otptest">>),
+         mysql:stop(Pid)
+     end,
+     fun ({Pid, Cwd}) ->
+          [{"Single statement", fun () -> load_data_local_infile(Pid, Cwd) end},
+          {"Missing file", fun () -> load_data_local_infile_missing(Pid, Cwd) end},
+          {"Not allowed", fun () -> load_data_local_infile_not_allowed(Pid, Cwd) end},
+          {"Multi statements", fun () -> load_data_local_infile_multi(Pid, Cwd) end}]
      end}.
 
 connect_with_db(_Pid) ->
@@ -300,6 +396,55 @@ log_warnings_test() ->
                  " in INSeRT INtO foo () VaLUeS ()\n", Log2),
     ?assertEqual("Warning 1364: Field 'x' doesn't have a default value\n"
                  " in INSERT INTO foo () VALUES ()\n", Log3),
+    mysql:stop(Pid).
+
+log_slow_queries_test() ->
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {log_warnings, false}, {log_slow_queries, true}]),
+    VersionStr = db_version_string(Pid),
+    try
+        Version = parse_db_version(VersionStr),
+        case is_mariadb(VersionStr) of
+            true when Version < [10, 0, 21] ->
+                throw({mariadb, version_too_small});
+            false when Version < [5, 5, 8] ->
+                throw({mysql, version_too_small});
+            _ ->
+                ok
+        end
+    of _ ->
+        ok = mysql:query(Pid, "SET long_query_time = 0.1"),
+
+        %% single statement should not include query number
+        SingleQuery = "SELECT SLEEP(0.2)",
+        {ok, _, SingleLogged} = error_logger_acc:capture( fun () ->
+            {ok, _, _} = mysql:query(Pid, SingleQuery)
+        end),
+        [{_, SingleLog}] = SingleLogged,
+        ?assertEqual("MySQL query was slow: " ++ SingleQuery ++ "\n", SingleLog),
+
+        %% multi statement should include number of slow query
+        MultiQuery = "SELECT SLEEP(0.2); " %% #1 -> slow
+                     "SELECT 1; "          %% #2 -> not slow
+                     "SET @foo = 1; "      %% #3 -> not slow, no result set
+                     "SELECT SLEEP(0.2); " %% #4 -> slow
+                     "SELECT 1",           %% #5 -> not slow
+        {ok, _, MultiLogged} = error_logger_acc:capture(fun () ->
+            {ok, _} = mysql:query(Pid, MultiQuery)
+        end),
+        [{_, MultiLog1}, {_, MultiLog2}] = MultiLogged,
+        ?assertEqual("MySQL query #1 was slow: " ++ MultiQuery ++ "\n", MultiLog1),
+        ?assertEqual("MySQL query #4 was slow: " ++ MultiQuery ++ "\n", MultiLog2)
+    catch
+        throw:{mysql, version_too_small} ->
+            error_logger:info_msg("Skipping Log Slow Queries test. Current MySQL version"
+                                  " is ~s. Required version is >= 5.5.8.~n",
+                                  [VersionStr]);
+        throw:{mariadb, version_too_small} ->
+            error_logger:info_msg("Skipping Log Slow Queries test. Current MariaDB version"
+                                  " is ~s. Required version is >= 10.0.21.~n",
+                                  [VersionStr])
+    end,
     mysql:stop(Pid).
 
 autocommit(Pid) ->
@@ -746,6 +891,69 @@ invalid_params(Pid) ->
     ?assertError(badarg, mysql:query(Pid, "SELECT ?", [x])),
     ok = mysql:unprepare(Pid, StmtId).
 
+load_data_local_infile(Pid, Cwd) ->
+    File = iolist_to_binary(filename:join([Cwd, "load_local_infile_test.csv"])),
+    ok = file:write_file(File, <<"1;value 1\n2;value 2\n">>),
+    ok = mysql:query(Pid, <<"CREATE TABLE load_local_test (id int, value blob)">>),
+    ok = mysql:query(Pid, <<"LOAD DATA LOCAL "
+                            "INFILE '", File/binary, "' "
+                            "INTO TABLE load_local_test "
+                            "FIELDS TERMINATED BY ';' "
+                            "LINES TERMINATED BY '\\n'">>),
+    ok = file:delete(File),
+    {ok, Columns, Rows} = mysql:query(Pid,
+                                      <<"SELECT * FROM load_local_test ORDER BY id">>),
+    ?assertEqual([<<"id">>, <<"value">>], Columns),
+    ?assertEqual([[1, <<"value 1">>], [2, <<"value 2">>]], Rows),
+    ok = mysql:query(Pid, <<"DROP TABLE load_local_test">>).
+
+load_data_local_infile_missing(Pid, Cwd) ->
+    File = iolist_to_binary(filename:join([Cwd, "load_local_infile_missing_test.csv"])),
+    ok = mysql:query(Pid, <<"CREATE TABLE load_local_test (id int, value blob)">>),
+    Result = mysql:query(Pid, <<"LOAD DATA LOCAL "
+                                "INFILE '", File/binary, "' "
+                                "INTO TABLE load_local_test "
+                                "FIELDS TERMINATED BY ';' "
+                                "LINES TERMINATED BY '\\n'">>),
+    FilenameSize=byte_size(File),
+    ?assertMatch({error, {-2, undefined, <<"The server requested a file which could "
+                                           "not be opened by the client: ",
+                                           File:FilenameSize/binary, _/binary>>}},
+                 Result),
+    ok = mysql:query(Pid, <<"DROP TABLE load_local_test">>).
+
+load_data_local_infile_not_allowed(Pid, Cwd) ->
+    File = iolist_to_binary(filename:join([Cwd, "../load_local_infile_not_allowed_test.csv"])),
+    ok = mysql:query(Pid, <<"CREATE TABLE load_local_test (id int, value blob)">>),
+    Result = mysql:query(Pid, <<"LOAD DATA LOCAL "
+                                "INFILE '", File/binary, "' "
+                                "INTO TABLE load_local_test "
+                                "FIELDS TERMINATED BY ';' "
+                                "LINES TERMINATED BY '\\n'">>),
+    ?assertEqual({error, {-1, undefined, <<"The server requested a file not permitted "
+                                           "by the client: ", File/binary>>}}, Result),
+    ok = mysql:query(Pid, <<"DROP TABLE load_local_test">>).
+
+load_data_local_infile_multi(Pid, Cwd) ->
+    File = iolist_to_binary(filename:join([Cwd, "load_local_infile_test.csv"])),
+    ok = file:write_file(File, <<"1;value 1\n2;value 2\n">>),
+    ok = mysql:query(Pid, <<"CREATE TABLE load_local_test (id int, value blob)">>),
+    {ok, [Res1, Res2]} = mysql:query(Pid, <<"SELECT 'foo'; "
+                                            "LOAD DATA LOCAL "
+                                            "INFILE '", File/binary, "' "
+                                            "INTO TABLE load_local_test "
+                                            "FIELDS TERMINATED BY ';' "
+                                            "LINES TERMINATED BY '\\n'; "
+                                            "SELECT 'bar'">>),
+    ok = file:delete(File),
+    ?assertEqual({[<<"foo">>], [[<<"foo">>]]}, Res1),
+    ?assertEqual({[<<"bar">>], [[<<"bar">>]]}, Res2),
+    {ok, Columns, Rows} = mysql:query(Pid,
+                                      <<"SELECT * FROM load_local_test ORDER BY id">>),
+    ?assertEqual([<<"id">>, <<"value">>], Columns),
+    ?assertEqual([[1, <<"value 1">>], [2, <<"value 2">>]], Rows),
+    ok = mysql:query(Pid, <<"DROP TABLE load_local_test">>).
+
 %% @doc Tests write and read in text and the binary protocol, all combinations.
 %% This helper function assumes an empty table with a single column.
 write_read_text_binary(Conn, Term, SqlLiteral, Table, Column) ->
@@ -885,3 +1093,13 @@ parse_db_version(Version) ->
   [Version1 | _] = binary:split(Version, <<"-">>),
   lists:map(fun binary_to_integer/1,
             binary:split(Version1, <<".">>, [global])).
+
+is_access_denied({1045, <<"28000">>, <<"Access denie", _/binary>>}) ->
+    true; % MySQL 5.x, etc.
+is_access_denied({1698, <<"28000">>, <<"Access denie", _/binary>>}) ->
+    true; % MariaDB 10.3.15
+is_access_denied({1251, <<"08004">>, <<"Client does not support authentication "
+                                       "protocol requested", _/binary>>}) ->
+    true; % This has been observed with MariaDB 10.3.13
+is_access_denied(_) ->
+    false.

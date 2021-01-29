@@ -4,6 +4,7 @@ MySQL/OTP
 [![Build Status](https://travis-ci.org/mysql-otp/mysql-otp.svg?branch=master)](https://travis-ci.org/mysql-otp/mysql-otp)
  :link: [Test coverage (EUnit)](//mysql-otp.github.io/mysql-otp/eunit.html)
  :link: [API documentation (EDoc)](//mysql-otp.github.io/mysql-otp/index.html)
+ :link: [Hex package](//hex.pm/packages/mysql)
 
 MySQL/OTP is a driver for connecting Erlang/OTP applications to MySQL and
 MariaDB databases. It is a native implementation of the MySQL protocol in
@@ -16,9 +17,10 @@ Some of the features:
   * Transactions are automatically retried when deadlocks are detected.
 * Each connection is a gen_server, which makes it compatible with Poolboy (for
   connection pooling) and ordinary OTP supervisors.
-* No records in the public API.
 * SSL.
-* Parametrized queries using cached prepared statements
+* Authentication methods `caching_sha2_password` (default from MySQL 8.0.4) and
+  `mysql_native_password` (default from MySQL 4.1).
+* Parametrized queries using cached unnamed prepared statements
   ([What?](https://github.com/mysql-otp/mysql-otp/wiki/Parametrized-queries-using-cached-prepared-statements))
 * Slow queries are interrupted without killing the connection (MySQL version
   ≥ 5.0.0)
@@ -29,11 +31,7 @@ Requirements:
 
 * Erlang/OTP version R16B or later
 * MySQL database version 4.1 or later or MariaDB
-* No other dependencies
-* Authentication method `caching_sha2_password` is not supported. This is the
-  default in MySQL 8.0.4 and later, so you need to add
-  `default_authentication_plugin=mysql_native_password` under `[mysqld]` in e.g.
-  `/etc/mysql/my.cnf`.
+* GNU Make *or* Rebar or any other tool for building Erlang/OTP applications
 
 Synopsis
 --------
@@ -68,7 +66,7 @@ case Result of
         io:format("Inserted 2 rows.~n");
     {aborted, Reason} ->
         io:format("Inserted 0 rows.~n")
-end
+end,
 
 %% Multiple queries and multiple result sets
 {ok, [{[<<"foo">>], [[42]]}, {[<<"bar">>], [[<<"baz">>]]}]} =
@@ -88,14 +86,20 @@ Usage as a dependency
 Using *erlang.mk*:
 
     DEPS = mysql
-    dep_mysql = git https://github.com/mysql-otp/mysql-otp 1.5.0
+    dep_mysql = git https://github.com/mysql-otp/mysql-otp 1.7.0
 
 Using *rebar* (version 2 or 3):
 
     {deps, [
         {mysql, ".*", {git, "https://github.com/mysql-otp/mysql-otp",
-                       {tag, "1.5.0"}}}
+                       {tag, "1.7.0"}}}
     ]}.
+
+Using *mix*:
+
+    {:mysql, git: "https://github.com/mysql-otp/mysql-otp", tag: "1.7.0"},
+
+There's also a Hex package called [mysql](//hex.pm/packages/mysql).
 
 Tests
 -----
@@ -120,8 +124,13 @@ GRANT ALL PRIVILEGES ON otptest.* TO otptest@localhost;
 CREATE USER otptest2@localhost IDENTIFIED BY 'otptest2';
 GRANT ALL PRIVILEGES ON otptest.* TO otptest2@localhost;
 
+-- in MySQL < 5.7, REQUIRE SSL must be given in GRANT
 CREATE USER otptestssl@localhost IDENTIFIED BY 'otptestssl';
 GRANT ALL PRIVILEGES ON otptest.* TO otptestssl@localhost REQUIRE SSL;
+
+-- in MySQL >= 8.0, REQUIRE SSL must be given in CREATE USER
+CREATE USER otptestssl@localhost IDENTIFIED BY 'otptestssl' REQUIRE SSL;
+GRANT ALL PRIVILEGES ON otptest.* TO otptestssl@localhost;
 ```
 
 Before running the test suite `ssl_tests` you'll also need to generate SSL files
@@ -162,6 +171,13 @@ Tagging a new version:
   * Update the changelog using `make CHANGELOG.md` and commit it.
   * Update the online documentation and coverage reports using `make gh-pages`.
     Then push the gh-pages branch using `git push origin gh-pages`.
+
+Updating the Hex package using rebar3:
+
+1. Setup the rebar3 hex plugin and authentication;
+    see [rebar3_hex](https://github.com/tsloughter/rebar3_hex).
+2. `rebar3 hex publish`
+3. `rebar3 hex docs`
 
 License
 -------

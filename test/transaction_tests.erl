@@ -211,10 +211,10 @@ deadlock_test_() ->
          mysql:stop(Conn2)
      end,
      fun (Conns) ->
-         [{"Plain queries", fun () -> deadlock_plain_queries(Conns) end},
-          {"Prep stmts", fun () -> deadlock_prepared_statements(Conns) end},
-          {"No retry", fun () -> deadlock_no_retry(Conns) end},
-          {"Lock wait timeout", fun () -> lock_wait_timeout(Conns) end}]
+             [{"Plain queries", fun () -> deadlock_plain_queries(Conns) end},
+              {"Prep stmts", fun () -> deadlock_prepared_statements(Conns) end},
+              {"No retry", fun () -> deadlock_no_retry(Conns) end},
+              {"Lock wait timeout", fun () -> lock_wait_timeout(Conns) end}]
      end}.
 
 flush_inbox() ->
