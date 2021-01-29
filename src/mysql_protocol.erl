@@ -59,6 +59,12 @@
 -define(authmethod_sha256_password, <<"sha256_password">>).
 -define(authmethod_caching_sha2_password, <<"caching_sha2_password">>).
 
+-if(?OTP_RELEASE >= 23).
+-define(DEFAINE_SSL_VERSIONS, ['tlsv1.3','tlsv1.2','tlsv1.1']).
+-else.
+-define(DEFAINE_SSL_VERSIONS, ['tlsv1.2','tlsv1.1','tlsv1']).
+-endif.
+
 %% @doc Performs a handshake using the supplied socket and socket module for
 %% communication. Returns an ok or an error record. Raises errors when various
 %% unimplemented features are requested.
@@ -405,7 +411,7 @@ maybe_do_ssl_upgrade(Host, gen_tcp, Socket0, SeqNum1, Handshake, SSLOpts,
     end.
 
 ssl_connect(Host, Port, ConfigSSLOpts, Timeout) ->
-    DefaultSSLOpts0 = [{versions, [tlsv1]}, {verify, verify_peer}],
+    DefaultSSLOpts0 = [{verify, verify_peer} | defaults_ssl_versions()],
     DefaultSSLOpts1 = case is_list(Host) andalso inet:parse_address(Host) of
         false -> DefaultSSLOpts0;
         {ok, _} -> DefaultSSLOpts0;
@@ -414,6 +420,12 @@ ssl_connect(Host, Port, ConfigSSLOpts, Timeout) ->
     MandatorySSLOpts = [{active, false}],
     MergedSSLOpts = merge_ssl_options(DefaultSSLOpts1, MandatorySSLOpts, ConfigSSLOpts),
     ssl:connect(Port, MergedSSLOpts, Timeout).
+
+defaults_ssl_versions() ->
+    Ciphers = lists:concat([ssl:cipher_suites(all, V) ||
+                            V <- ?DEFAINE_SSL_VERSIONS]),
+    [{versions, ?DEFAINE_SSL_VERSIONS},
+     {ciphers, Ciphers}].
 
 -spec merge_ssl_options(list(), list(), list()) -> list().
 merge_ssl_options(DefaultSSLOpts, MandatorySSLOpts, ConfigSSLOpts) ->
