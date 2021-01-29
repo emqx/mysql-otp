@@ -31,6 +31,18 @@ before_script:
 script: 'make tests'
 jobs:
   include:
+    - name: OTP/23.2 + MySQL8.0
+      dist: xenial
+      env: MYSQL8=1
+      services:
+        - mysql
+      otp_release: 23.2
+    - name: OTP/23.2 + MySQL5.7
+      dist: xenial
+      env: MYSQL8=0
+      services:
+        - mysql
+      otp_release: 23.2
     - name: OTP/22.1 + MySQL8.0
       dist: xenial
       env: MYSQL8=1
