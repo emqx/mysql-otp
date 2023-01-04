@@ -1,0 +1,16 @@
+%% -*- mode: erlang -*-
+%% Unless you know what you are doing, DO NOT edit manually!!
+{"1.7.2",
+  [{<<"1\\.7\\.[0-1]">>,
+    [{load_module,mysql_protocol,brutal_purge,soft_purge,[]},
+     {load_module,mysql_conn,brutal_purge,soft_purge,[]}
+    ]},
+   {<<".*">>,[]}
+  ],
+  [{<<"1\\.7\\.[0-1]">>,
+    [{load_module,mysql_protocol,brutal_purge,soft_purge,[]},
+     {load_module,mysql_conn,brutal_purge,soft_purge,[]}
+    ]},
+   {<<".*">>,[]}
+  ]
+}.
