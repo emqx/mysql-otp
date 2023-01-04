@@ -32,6 +32,8 @@
          execute/7, fetch_execute_response/5, reset_connnection/2,
          valid_params/1, valid_path/1]).
 
+-export([maybe_parse_error_packet/1]).
+
 -type query_filtermap() :: no_filtermap_fun | mysql:query_filtermap_fun().
 
 -type auth_more_data() :: fast_auth_completed
@@ -124,7 +126,7 @@ handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum)
 %% If the authentication process requires more data to be exchanged between
 %% the server and client, this is done via More Data Packets. The formats and
 %% meanings of the payloads in such packets depend on the auth method.
-%% 
+%%
 %% An Auth Method Switch Packet signals a request for transition to another
 %% auth method. The packet contains the name of the auth method to switch to,
 %% and new auth plugin data.
@@ -1381,6 +1383,24 @@ parse_ok_packet(<<?OK:8, Rest/binary>>) ->
         status = StatusFlags,
         warning_count = WarningCount,
         msg = Msg}.
+
+-spec maybe_parse_error_packet(binary()) -> {ok, #error{}} | {error, not_error_packet}.
+maybe_parse_error_packet(<<Header:4/binary, Body/binary>>) ->
+    case parse_packet_header(Header) of
+        {_Size, _SeqNum, true} ->
+            %% The error texts cannot exceed MYSQL_ERRMSG_SIZE, see:
+            %% https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_err_packet.html
+            {error, packet_too_long};
+        {_Size, _SeqNum, false} ->
+            do_maybe_parse_error_packet(Body)
+    end;
+maybe_parse_error_packet(_Packet) ->
+    {error, invalid_packet}.
+
+do_maybe_parse_error_packet(?error_pattern = Packet) ->
+    {ok, parse_error_packet(Packet)};
+do_maybe_parse_error_packet(_) ->
+    {error, not_error_packet}.
 
 -spec parse_error_packet(binary()) -> #error{}.
 parse_error_packet(<<?ERROR:8, ErrNo:16/little, "#", SQLState:5/binary-unit:8,

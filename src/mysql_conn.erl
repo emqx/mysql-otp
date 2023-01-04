@@ -527,10 +527,27 @@ handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     #ok{} = mysql_protocol:ping(SockMod, Socket),
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, schedule_ping(State)};
-handle_info({tcp_closed, _Socket}, State) ->
-    {stop, normal, State#state{socket = undefined, connection_id = undefined}}; 
-handle_info({tcp_error, _Socket, Reason}, State) ->
-    stop_server({tcp_error, Reason}, State);
+handle_info({SockClosed, _Socket}, State) when SockClosed =:= tcp_closed; SockClosed =:= ssl_closed ->
+    {stop, normal, State#state{socket = undefined, connection_id = undefined}};
+handle_info({SockError, _Socket, Reason}, State) when SockError =:= tcp_error; SockError =:= ssl_error ->
+    stop_server({SockError, Reason}, State);
+handle_info({SockType, _Socket, ErrorPacket}, #state{socket = Socket, sockmod = SockMod} = State)
+        when SockType =:= tcp; SockType =:= ssl ->
+    %% Sometimes the mysql sends us an error response even if we have never sent any requests.
+    %% Following is an example of the error response:
+    %% - Error Code: 4031
+    %% - SQL state: HY000
+    %% - Error message: The client was disconnected by the server because of inactivity.
+    %%                  See wait_timeout and interactive_timeout for configuring this behavior.
+    case mysql_protocol:maybe_parse_error_packet(ErrorPacket) of
+        {ok, #error{code = ErrCode, state = SQLState, msg = ErrMsg}} ->
+            error_logger:error_msg("Received error from MySQL. Code: ~p, SQLState: ~p, Message: ~p",
+                                   [ErrCode, SQLState, ErrMsg]);
+        {error, _} ->
+            ok
+    end,
+    setopts(SockMod, Socket, [{active, once}]),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -773,10 +790,10 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
 stop_server(Reason, #state{socket = undefined} = State) ->
   {stop, Reason, State};
 stop_server(Reason,
-            #state{socket = Socket, connection_id = ConnId} = State) ->
+            #state{socket = Socket, sockmod = SockMod, connection_id = ConnId} = State) ->
   error_logger:error_msg("Connection Id ~p closing with reason: ~p~n",
                          [ConnId, Reason]),
-  ok = gen_tcp:close(Socket),
+  ok = SockMod:close(Socket),
   {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
 
 setopts(gen_tcp, Socket, Opts) ->
