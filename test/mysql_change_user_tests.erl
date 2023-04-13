@@ -187,6 +187,6 @@ connect_db(User, Password) ->
 
 is_current_user(Pid, User) when is_binary(User) ->
     {ok, [<<"CURRENT_USER()">>], [[CurUser]]}=mysql:query(Pid, <<"SELECT CURRENT_USER()">>),
-    <<User/binary, "@localhost">> =:= CurUser;
+    <<User/binary, "@%">> =:= CurUser;
 is_current_user(Pid, User) ->
     is_current_user(Pid, iolist_to_binary(User)).

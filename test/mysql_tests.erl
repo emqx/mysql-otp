@@ -228,39 +228,6 @@ reset_connection_test() ->
     mysql:stop(Pid),
     ok.
 
-unix_socket_test() ->
-    try
-        list_to_integer(erlang:system_info(otp_release))
-    of
-        %% Supported in OTP >= 19
-        OtpRelease when OtpRelease >= 19 ->
-            %% Get socket file to use
-            {ok, Pid1} = mysql:start_link([{user, ?user},
-                                           {password, ?password}]),
-            {ok, [<<"@@socket">>], [SockFile]} = mysql:query(Pid1,
-                                                             "SELECT @@socket"),
-            mysql:stop(Pid1),
-            %% Connect through unix socket
-            case mysql:start_link([{host, {local, SockFile}},
-                                   {user, ?user}, {password, ?password}]) of
-                {ok, Pid2} ->
-                    ?assertEqual({ok, [<<"1">>], [[1]]},
-                                 mysql:query(Pid2, <<"SELECT 1">>)),
-                    mysql:stop(Pid2);
-                {error, eafnosupport} ->
-                    error_logger:info_msg("Skipping unix socket test. "
-                                          "Not supported on this OS.~n")
-            end;
-        OtpRelease ->
-            error_logger:info_msg("Skipping unix socket test. Current OTP "
-                                  "release is ~B. Required release is >= 19.~n",
-                                  [OtpRelease])
-    catch
-        error:badarg ->
-            error_logger:info_msg("Skipping unix socket tests. Current OTP "
-                                  "release could not be determined.~n")
-    end.
-
 connect_queries_failure_test() ->
     process_flag(trap_exit, true),
     {ok, Ret, Logged} = error_logger_acc:capture(

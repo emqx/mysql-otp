@@ -1,8 +1,7 @@
 MySQL/OTP
 =========
 
-[![Build Status](https://travis-ci.org/mysql-otp/mysql-otp.svg?branch=master)](https://travis-ci.org/mysql-otp/mysql-otp)
- :link: [Test coverage (EUnit)](//mysql-otp.github.io/mysql-otp/eunit.html)
+[![Build status](https://github.com/emqx/mysql-otp/actions/workflows/main.yml/badge.svg)](https://github.com/mysql-otp/jsone/actions/workflows/main.yml)
  :link: [API documentation (EDoc)](//mysql-otp.github.io/mysql-otp/index.html)
  :link: [Hex package](//hex.pm/packages/mysql)
 
