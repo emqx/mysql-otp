@@ -35,7 +35,7 @@ successful_ssl_connect_test() ->
     ok.
 
 common_basic_check(ExtraOpts) ->
-    Options = [{name, {local, tardis}},
+    Options = [{name, {local, tardis}}, {port, 3307},
                {queries, ["SET @foo = 'bar'", "SELECT 1",
                           "SELECT 1; SELECT 2"]},
                {prepare, [{foo, "SELECT @foo"}]} | ExtraOpts],

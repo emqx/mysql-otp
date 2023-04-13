@@ -1,0 +1,34 @@
+version: '3.9'
+
+services:
+  mysql:
+    container_name: mysql
+    image: mysql:8
+    restart: always
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: true
+    ports:
+      - "3306:3306"
+    volumes:
+      - type: bind
+        source: ./my-otp.cnf
+        target: /etc/mysql/conf.d/my-otp.cnf
+
+  mysql-ssl:
+    container_name: mysql-ssl
+    image: mysql:8
+    restart: always
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: true
+    volumes:
+      - type: bind
+        source: ../test/ssl
+        target: /etc/certs
+    ports:
+      - "3307:3306"
+    command:
+      - --ssl-ca=/etc/certs/ca.pem
+      - --ssl-cert=/etc/certs/server-cert.pem
+      - --ssl-key=/etc/certs/server-key.pem
+      - --require-secure-transport=ON
+
