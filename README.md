@@ -1,7 +1,6 @@
-MySQL/OTP
+MySQL/OTP [![Build status](https://github.com/emqx/mysql-otp/actions/workflows/main.yml/badge.svg)](https://github.com/mysql-otp/jsone/actions/workflows/main.yml)
 =========
 
-[![Build status](https://github.com/emqx/mysql-otp/actions/workflows/main.yml/badge.svg)](https://github.com/mysql-otp/jsone/actions/workflows/main.yml)
  :link: [API documentation (EDoc)](//mysql-otp.github.io/mysql-otp/index.html)
  :link: [Hex package](//hex.pm/packages/mysql)
 
