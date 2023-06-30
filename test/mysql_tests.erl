@@ -52,6 +52,25 @@ connect_synchronous_test() ->
     mysql:stop(Pid),
     ok.
 
+connect_synchronous_nxdomain_error_test() ->
+    process_flag(trap_exit, true),
+    ?assertMatch(
+       {error, nxdomain},
+       mysql:start_link([{user, ?user},
+                         {password, ?password},
+                         {host, "i.dont.exist"},
+                         {connect_mode, synchronous}])
+      ),
+    receive
+        {'EXIT', _From, nxdomain} ->
+            ok
+    after
+        1_000 ->
+            error(exit_signal_not_received)
+    end,
+    process_flag(trap_exit, false),
+    ok.
+
 connect_asynchronous_successful_test() ->
     {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
                                   {connect_mode, asynchronous}]),

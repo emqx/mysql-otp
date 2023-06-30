@@ -133,13 +133,17 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
     MainPid = self(),
     Pid = spawn_link(
         fun () ->
-            {ok, State1}=connect_socket(State),
-            case handshake(State1) of
-                {ok, #state{sockmod = SockMod, socket = Socket} = State2} ->
-                    SockMod:controlling_process(Socket, MainPid),
-                    MainPid ! {self(), {ok, State2}};
-                {error, _} = E ->
-                    MainPid ! {self(), E}
+            case connect_socket(State) of
+                {ok, State1} ->
+                    case handshake(State1) of
+                        {ok, #state{sockmod = SockMod, socket = Socket} = State2} ->
+                            SockMod:controlling_process(Socket, MainPid),
+                            MainPid ! {self(), {ok, State2}};
+                        {error, _} = E ->
+                            MainPid ! {self(), E}
+                    end;
+                Error ->
+                    MainPid ! {self(), Error}
             end
         end
     ),
@@ -157,20 +161,22 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
 connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
     %% Connect socket
     SockOpts = sanitize_tcp_opts(TcpOpts),
-    {ok, Socket} = gen_tcp:connect(Host, Port, SockOpts),
-
-    %% If buffer wasn't specifically defined make it at least as
-    %% large as recbuf, as suggested by the inet:setopts() docs.
-    case proplists:is_defined(buffer, TcpOpts) of
-        true ->
-            ok;
-        false ->
-            {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
-            {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
-            ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
-    end,
-
-    {ok, State#state{socket = Socket}}.
+    case gen_tcp:connect(Host, Port, SockOpts) of
+        {ok, Socket} ->
+            %% If buffer wasn't specifically defined make it at least as
+            %% large as recbuf, as suggested by the inet:setopts() docs.
+            case proplists:is_defined(buffer, TcpOpts) of
+                true ->
+                    ok;
+                false ->
+                    {ok, [{buffer, Buffer}]} = inet:getopts(Socket, [buffer]),
+                    {ok, [{recbuf, Recbuf}]} = inet:getopts(Socket, [recbuf]),
+                    ok = inet:setopts(Socket, [{buffer, max(Buffer, Recbuf)}])
+            end,
+            {ok, State#state{socket = Socket}};
+        Error ->
+            Error
+    end.
 
 sanitize_tcp_opts([{inet_backend, _} = InetBackend | TcpOpts0]) ->
     %% This option is be used to turn on the experimental socket backend for
