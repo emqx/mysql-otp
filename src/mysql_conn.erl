@@ -27,8 +27,17 @@
 -module(mysql_conn).
 
 -behaviour(gen_server).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
-         code_change/3]).
+
+%% gen_server.
+-export([ init/1
+        , handle_call/3
+        , handle_cast/2
+        , handle_info/2
+        , terminate/2
+        , code_change/3
+        , format_status/1
+        , format_status/2
+        ]).
 
 -define(default_host, "localhost").
 -define(default_port, 3306).
@@ -571,6 +580,12 @@ code_change(_OldVsn, State = #state{}, _Extra) ->
     {ok, State};
 code_change(_OldVsn, _State, _Extra) ->
     {error, incompatible_state}.
+
+format_status(#{state := State} = Status) ->
+    Status#{state := State#state{password = <<"******">>}}.
+
+format_status(_Opt, [_PDict, State]) ->
+    [{data, [{"State", State#state{password = <<"******">>}}]}].
 
 %% --- Helpers ---
 
