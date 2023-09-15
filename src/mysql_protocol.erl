@@ -192,6 +192,7 @@ quit(SockModule, Socket) ->
     {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_QUIT>>, 0),
     case recv_packet(SockModule, Socket, SeqNum1) of
         {error, closed} -> ok;            %% MySQL 5.5.40 and more
+        {error, etimedout} -> ok;
         {ok, ?ok_pattern, _SeqNum2} -> ok %% Some older MySQL versions?
     end.
 
