@@ -55,14 +55,15 @@ connect_synchronous_test() ->
 connect_synchronous_nxdomain_error_test() ->
     process_flag(trap_exit, true),
     ?assertMatch(
-       {error, nxdomain},
+       {error, #{cause := nxdomain}},
        mysql:start_link([{user, ?user},
                          {password, ?password},
                          {host, "i.dont.exist"},
                          {connect_mode, synchronous}])
       ),
     receive
-        {'EXIT', _From, nxdomain} ->
+        {'EXIT', _From, Reason} ->
+            ?assertMatch(#{cause := nxdomain}, Reason),
             ok
     after
         1_000 ->
@@ -85,7 +86,7 @@ connect_asynchronous_failing_test() ->
             {ok, Pid} = mysql:start_link([{user, "dummy"}, {password, "junk"},
                                           {connect_mode, asynchronous}]),
             receive
-                {'EXIT', Pid, {error, Error}} ->
+                {'EXIT', Pid, Error} ->
                     true = is_access_denied(Error),
                     ok
             after 1000 ->
@@ -272,7 +273,7 @@ connect_prepare_failure_test() ->
         end),
     ?assertMatch([{error_report, {crash_report, _}}], Logged),
     {error, Reason} = Ret,
-    ?assertMatch({1064, <<"42000">>, <<"You have an erro", _/binary>>}, Reason),
+    ?assertMatch(#{cause := {1064, <<"42000">>, <<"You have an erro", _/binary>>}}, Reason),
     receive
         {'EXIT', _Pid, Reason} -> ok
     after 1000 ->
@@ -1080,12 +1081,12 @@ parse_db_version(Version) ->
   lists:map(fun binary_to_integer/1,
             binary:split(Version1, <<".">>, [global])).
 
-is_access_denied({1045, <<"28000">>, <<"Access denie", _/binary>>}) ->
+is_access_denied(#{cause := {1045, <<"28000">>, <<"Access denie", _/binary>>}}) ->
     true; % MySQL 5.x, etc.
-is_access_denied({1698, <<"28000">>, <<"Access denie", _/binary>>}) ->
+is_access_denied(#{cause := {1698, <<"28000">>, <<"Access denie", _/binary>>}}) ->
     true; % MariaDB 10.3.15
-is_access_denied({1251, <<"08004">>, <<"Client does not support authentication "
-                                       "protocol requested", _/binary>>}) ->
+is_access_denied(#{cause := {1251, <<"08004">>, <<"Client does not support authentication "
+                                                  "protocol requested", _/binary>>}}) ->
     true; % This has been observed with MariaDB 10.3.13
 is_access_denied(_) ->
     false.
