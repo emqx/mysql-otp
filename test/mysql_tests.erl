@@ -54,28 +54,23 @@ connect_synchronous_test() ->
 
 connect_synchronous_nxdomain_error_test() ->
     process_flag(trap_exit, true),
-    try
-        ?assertMatch(
-        {error, #{cause := nxdomain}},
-        mysql:start_link([{user, ?user},
-                            {password, ?password},
-                            {host, "i.dont.exist"},
-                            {connect_mode, synchronous}])
-        ),
-        assert_init_exit(nxdomain)
-    after
-        process_flag(trap_exit, false)
-    end.
+    {error, Reason} = mysql:start_link([{user, ?user},
+                                        {password, ?password},
+                                        {host, "i.dont.exist"},
+                                        {connect_mode, synchronous}]),
+    ?assertMatch(#{cause := nxdomain}, Reason),
+    assert_init_exit(Reason),
+    process_flag(trap_exit, false).
 
 -if(?OTP_RELEASE >= 26).
 assert_init_exit(_) ->
     %% OTP 26 release note: proc_lib:start*/* has become synchronous when the started process fails
     ok.
 -else.
-assert_init_exit(Cause) ->
+assert_init_exit(Err) ->
     receive
         {'EXIT', _From, Reason} ->
-            ?assertMatch(#{cause := Cause}, Reason),
+            ?assertMatch(Err, Reason),
             ok
     after
         1_000 ->
@@ -127,11 +122,7 @@ failing_connect_test() ->
     ?assertMatch([_|_], Logged), % some errors logged
     {error, Error} = Ret,
     true = is_access_denied(Error),
-    receive
-        {'EXIT', _Pid, Error} -> ok
-    after 1000 ->
-        error(no_exit_message)
-    end,
+    assert_init_exit(Error),
     process_flag(trap_exit, false).
 
 successful_connect_test() ->
@@ -268,28 +259,21 @@ connect_queries_failure_test() ->
         end),
     ?assertMatch([{error_report, {crash_report, _}}], Logged),
     {error, Reason} = Ret,
-    receive
-        {'EXIT', _Pid, Reason} -> ok
-    after 1000 ->
-        exit(no_exit_message)
-    end,
+    assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
 connect_prepare_failure_test() ->
     process_flag(trap_exit, true),
     {ok, Ret, Logged} = error_logger_acc:capture(
         fun () ->
-            mysql:start_link([{user, ?user}, {password, ?password},
-                                                {prepare, [{foo, "foo"}]}])
+            mysql:start_link([{user, ?user},
+                              {password, ?password},
+                              {prepare, [{foo, "foo"}]}])
         end),
     ?assertMatch([{error_report, {crash_report, _}}], Logged),
     {error, Reason} = Ret,
     ?assertMatch(#{cause := {1064, <<"42000">>, <<"You have an erro", _/binary>>}}, Reason),
-    receive
-        {'EXIT', _Pid, Reason} -> ok
-    after 1000 ->
-        exit(no_exit_message)
-    end,
+    assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
 %% For R16B where sys:get_state/1 is not available.
