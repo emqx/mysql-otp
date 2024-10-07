@@ -54,22 +54,29 @@ connect_synchronous_test() ->
 
 connect_synchronous_nxdomain_error_test() ->
     process_flag(trap_exit, true),
-    ?assertMatch(
-       {error, nxdomain},
-       mysql:start_link([{user, ?user},
-                         {password, ?password},
-                         {host, "i.dont.exist"},
-                         {connect_mode, synchronous}])
-      ),
+    {error, Reason} = mysql:start_link([{user, ?user},
+                                        {password, ?password},
+                                        {host, "i.dont.exist"},
+                                        {connect_mode, synchronous}]),
+    ?assertMatch(#{cause := nxdomain}, Reason),
+    assert_init_exit(Reason),
+    process_flag(trap_exit, false).
+
+-if(?OTP_RELEASE >= 26).
+assert_init_exit(_) ->
+    %% OTP 26 release note: proc_lib:start*/* has become synchronous when the started process fails
+    ok.
+-else.
+assert_init_exit(Err) ->
     receive
-        {'EXIT', _From, nxdomain} ->
+        {'EXIT', _From, Reason} ->
+            ?assertMatch(Err, Reason),
             ok
     after
         1_000 ->
             error(exit_signal_not_received)
-    end,
-    process_flag(trap_exit, false),
-    ok.
+    end.
+-endif.
 
 connect_asynchronous_successful_test() ->
     {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
@@ -85,7 +92,7 @@ connect_asynchronous_failing_test() ->
             {ok, Pid} = mysql:start_link([{user, "dummy"}, {password, "junk"},
                                           {connect_mode, asynchronous}]),
             receive
-                {'EXIT', Pid, {error, Error}} ->
+                {'EXIT', Pid, Error} ->
                     true = is_access_denied(Error),
                     ok
             after 1000 ->
@@ -115,11 +122,7 @@ failing_connect_test() ->
     ?assertMatch([_|_], Logged), % some errors logged
     {error, Error} = Ret,
     true = is_access_denied(Error),
-    receive
-        {'EXIT', _Pid, Error} -> ok
-    after 1000 ->
-        error(no_exit_message)
-    end,
+    assert_init_exit(Error),
     process_flag(trap_exit, false).
 
 successful_connect_test() ->
@@ -256,28 +259,21 @@ connect_queries_failure_test() ->
         end),
     ?assertMatch([{error_report, {crash_report, _}}], Logged),
     {error, Reason} = Ret,
-    receive
-        {'EXIT', _Pid, Reason} -> ok
-    after 1000 ->
-        exit(no_exit_message)
-    end,
+    assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
 connect_prepare_failure_test() ->
     process_flag(trap_exit, true),
     {ok, Ret, Logged} = error_logger_acc:capture(
         fun () ->
-            mysql:start_link([{user, ?user}, {password, ?password},
-                                                {prepare, [{foo, "foo"}]}])
+            mysql:start_link([{user, ?user},
+                              {password, ?password},
+                              {prepare, [{foo, "foo"}]}])
         end),
     ?assertMatch([{error_report, {crash_report, _}}], Logged),
     {error, Reason} = Ret,
-    ?assertMatch({1064, <<"42000">>, <<"You have an erro", _/binary>>}, Reason),
-    receive
-        {'EXIT', _Pid, Reason} -> ok
-    after 1000 ->
-        exit(no_exit_message)
-    end,
+    ?assertMatch(#{cause := {1064, <<"42000">>, <<"You have an erro", _/binary>>}}, Reason),
+    assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
 %% For R16B where sys:get_state/1 is not available.
@@ -1080,12 +1076,12 @@ parse_db_version(Version) ->
   lists:map(fun binary_to_integer/1,
             binary:split(Version1, <<".">>, [global])).
 
-is_access_denied({1045, <<"28000">>, <<"Access denie", _/binary>>}) ->
+is_access_denied(#{cause := {1045, <<"28000">>, <<"Access denie", _/binary>>}}) ->
     true; % MySQL 5.x, etc.
-is_access_denied({1698, <<"28000">>, <<"Access denie", _/binary>>}) ->
+is_access_denied(#{cause := {1698, <<"28000">>, <<"Access denie", _/binary>>}}) ->
     true; % MariaDB 10.3.15
-is_access_denied({1251, <<"08004">>, <<"Client does not support authentication "
-                                       "protocol requested", _/binary>>}) ->
+is_access_denied(#{cause := {1251, <<"08004">>, <<"Client does not support authentication "
+                                                  "protocol requested", _/binary>>}}) ->
     true; % This has been observed with MariaDB 10.3.13
 is_access_denied(_) ->
     false.

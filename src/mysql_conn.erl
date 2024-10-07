@@ -129,7 +129,12 @@ init(Opts) ->
                 {ok, State1} ->
                     {ok, State1};
                 {error, Reason} ->
-                    {stop, Reason}
+                    {stop, #{cause => Reason,
+                             host => Host,
+                             port => Port,
+                             database => Database,
+                             user => User
+                            }}
             end;
         asynchronous ->
             gen_server:cast(self(), connect),
@@ -505,12 +510,19 @@ handle_call(commit, {FromPid, _},
     {reply, ok, State1#state{transaction_levels = L}}.
 
 %% @private
-handle_cast(connect, #state{socket = undefined} = State) ->
+handle_cast(connect, #state{socket = undefined, host = Host, port = Port,
+                            user = User, database = Database
+                           } = State) ->
     case connect(State) of
         {ok, State1} ->
             {noreply, State1};
-        {error, _} = E ->
-            {stop, E, State}
+        {error, Reason} ->
+            {stop, #{cause => Reason,
+                     host => Host,
+                     port => Port,
+                     user => User,
+                     database => Database
+                    }, State}
     end;
 handle_cast(connect, State) ->
     {noreply, State};
