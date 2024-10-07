@@ -54,23 +54,34 @@ connect_synchronous_test() ->
 
 connect_synchronous_nxdomain_error_test() ->
     process_flag(trap_exit, true),
-    ?assertMatch(
-       {error, #{cause := nxdomain}},
-       mysql:start_link([{user, ?user},
-                         {password, ?password},
-                         {host, "i.dont.exist"},
-                         {connect_mode, synchronous}])
-      ),
+    try
+        ?assertMatch(
+        {error, #{cause := nxdomain}},
+        mysql:start_link([{user, ?user},
+                            {password, ?password},
+                            {host, "i.dont.exist"},
+                            {connect_mode, synchronous}])
+        ),
+        assert_init_exit(nxdomain)
+    after
+        process_flag(trap_exit, false)
+    end.
+
+-if(?OTP_RELEASE >= 26).
+assert_init_exit(_) ->
+    %% OTP 26 release note: proc_lib:start*/* has become synchronous when the started process fails
+    ok.
+-else.
+assert_init_exit(Cause) ->
     receive
         {'EXIT', _From, Reason} ->
-            ?assertMatch(#{cause := nxdomain}, Reason),
+            ?assertMatch(#{cause := Cause}, Reason),
             ok
     after
         1_000 ->
             error(exit_signal_not_received)
-    end,
-    process_flag(trap_exit, false),
-    ok.
+    end.
+-endif.
 
 connect_asynchronous_successful_test() ->
     {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
