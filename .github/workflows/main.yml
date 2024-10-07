@@ -13,7 +13,7 @@ jobs:
     runs-on: ${{matrix.os}}
     strategy:
       matrix:
-        otp: [24, 25]
+        otp: [25, 26]
         os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v3
