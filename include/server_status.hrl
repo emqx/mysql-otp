@@ -23,7 +23,6 @@
 -define(SERVER_MORE_RESULTS_EXISTS, 16#0008).
 -define(SERVER_STATUS_NO_GOOD_INDEX_USED, 16#0010).
 -define(SERVER_STATUS_NO_INDEX_USED, 16#0020).
--define(SERVER_STATUS_NO_INDEX_USED_AUTOCOMMIT, 16#0022). %% No index used, but auto-commit is enabled
 -define(SERVER_STATUS_CURSOR_EXISTS, 16#0040).  %% Used by Binary Protocol
                                                 %% Resultset to signal that
                                                 %% COM_STMT_FETCH has to be used
