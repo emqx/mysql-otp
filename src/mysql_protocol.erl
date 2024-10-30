@@ -109,7 +109,7 @@ handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum)
         #ok{status = OkStatus} ->
             %% check status, ignoring bit 16#4000, SERVER_SESSION_STATE_CHANGED
             %% and bit 16#0002, SERVER_STATUS_AUTOCOMMIT.
-            BitMask = bnot (?SERVER_SESSION_STATE_CHANGED bor ?SERVER_STATUS_AUTOCOMMIT),
+            BitMask = bnot (?SERVER_SESSION_STATE_CHANGED bor ?SERVER_STATUS_AUTOCOMMIT bor ?SERVER_MORE_RESULTS_EXISTS),
             StatusMasked = Status band BitMask,
             StatusMasked = OkStatus band BitMask,
             {ok, Handshake, SockModule, Socket};
