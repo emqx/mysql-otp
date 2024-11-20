@@ -22,10 +22,12 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+-define(conn_state_socket_position, 4).
+
 -define(user,         "otptest").
--define(password,     "otptest").
+-define(password,     "OtpTest--123").
 -define(ssl_user,     "otptestssl").
--define(ssl_password, "otptestssl").
+-define(ssl_password, "OtpTestSSL--123").
 
 %% We need to set a the SQL mode so it is consistent across MySQL versions
 %% and distributions.
@@ -38,6 +40,7 @@
                           "  f FLOAT,"
                           "  d DOUBLE,"
                           "  dc DECIMAL(5,3),"
+                          "  ldc DECIMAL(25,3),"
                           "  y YEAR,"
                           "  ti TIME,"
                           "  ts TIMESTAMP,"
@@ -73,7 +76,7 @@ assert_init_exit(Err) ->
             ?assertMatch(Err, Reason),
             ok
     after
-        1_000 ->
+        1000 ->
             error(exit_signal_not_received)
     end.
 -endif.
@@ -147,6 +150,28 @@ common_basic_check(ExtraOpts) ->
                  mysql:execute(Pid, foo, [])),
     Pid.
 
+successful_connect_binary_ref_test() ->
+    %% A connection with a registered name and execute initial queries and
+    %% create prepared statements.
+    Pid = common_basic_check_binary_ref([{user, ?user}, {password, ?password}]),
+
+    %% Test some gen_server callbacks not tested elsewhere
+    State = get_state(Pid),
+    ?assertMatch({ok, State}, mysql_conn:code_change("0.1.0", State, [])),
+    ?assertMatch({error, _}, mysql_conn:code_change("2.0.0", unknown_state, [])),
+    common_conn_close().
+
+common_basic_check_binary_ref(ExtraOpts) ->
+    Options = [{name, {local, tardis}},
+               {queries, ["SET @foo = 'bar'", "SELECT 1",
+                          "SELECT 1; SELECT 2"]},
+               {prepare, [{<<"foo">>, "SELECT @foo"}]} | ExtraOpts],
+    {ok, Pid} = mysql:start_link(Options),
+    %% Check that queries and prepare has been done.
+    ?assertEqual({ok, [<<"@foo">>], [[<<"bar">>]]},
+                 mysql:execute(Pid, <<"foo">>, [])),
+    Pid.
+
 common_conn_close() ->
     Pid = whereis(tardis),
     process_flag(trap_exit, true),
@@ -181,7 +206,8 @@ server_disconnect_test() ->
         %% Make the server close the connection after 1 second of inactivity.
         ok = mysql:query(Pid, <<"SET SESSION wait_timeout = 1">>),
         receive
-            {'EXIT', Pid, normal} -> ok
+            {'EXIT', Pid, tcp_closed} -> ok;
+            {'EXIT', Pid, ssl_closed} -> ok
         after 2000 ->
             no_exit_message
         end
@@ -189,13 +215,23 @@ server_disconnect_test() ->
     process_flag(trap_exit, false),
     ?assertExit(noproc, mysql:stop(Pid)).
 
+unexpected_message_test() ->
+    Options = [{user, ?user}, {password, ?password}],
+    {ok, Pid} = mysql:start_link(Options),
+    Sock = get_socket_from_conn(Pid),
+    {ok, [{active, once}]} = inet:getopts(Sock, [active]),
+    Pid ! {tcp, Sock, <<"Dummy\n">>},
+    {ok, [{active, once}]} = inet:getopts(Sock, [active]),
+    ok.
+
 tcp_error_test() ->
     process_flag(trap_exit, true),
     Options = [{user, ?user}, {password, ?password}],
     {ok, Pid} = mysql:start_link(Options),
+    Sock = get_socket_from_conn(Pid),
     {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
         %% Simulate a tcp error by sending a message. (Is there a better way?)
-        Pid ! {tcp_error, dummy_socket, tcp_reason},
+        Pid ! {tcp_error, Sock, tcp_reason},
         receive
             {'EXIT', Pid, {tcp_error, tcp_reason}} -> ok
         after 1000 ->
@@ -235,6 +271,7 @@ reset_connection_test() ->
     %% Ignored test with MySQL earlier than 5.7
     Options = [{user, ?user}, {password, ?password}, {keep_alive, true}],
     {ok, Pid} = mysql:start_link(Options),
+    ok = mysql:query(Pid, <<"DROP DATABASE IF EXISTS otptest">>),
     ok = mysql:query(Pid, <<"CREATE DATABASE otptest">>),
     ok = mysql:query(Pid, <<"USE otptest">>),
     ok = mysql:query(Pid, <<"SET autocommit = 1">>),
@@ -249,6 +286,61 @@ reset_connection_test() ->
     end,
     mysql:stop(Pid),
     ok.
+
+run_dir() ->
+    CiDir = filename:join(["scripts", "run"]),
+    case filelib:wildcard("*.pid", CiDir) of
+        [] ->
+            %% Assume MySQL or MariaDB is running in host
+            "/var/run/mysqld/";
+        _ ->
+            %% This is the mounted dir for MySQL or MariaDb running in docker
+            CiDir
+    end.
+
+unix_socket_test() ->
+    %% Get socket file to use
+    Dir = run_dir(),
+    {ok, Pid1} = mysql:start_link([{user, ?user},
+                                   {password, ?password}]),
+    {ok, [<<"@@socket">>], [[SockFile0]]} = mysql:query(Pid1, "SELECT @@socket"),
+    SockFile = filename:join([Dir, filename:basename(SockFile0)]),
+    mysql:stop(Pid1),
+    %% Connect through unix socket
+    case mysql:start_link([{host, {local, SockFile}},
+                           {user, ?user}, {password, ?password}]) of
+        {ok, Pid2} ->
+            ?assertEqual({ok, [<<"1">>], [[1]]},
+                            mysql:query(Pid2, <<"SELECT 1">>)),
+            mysql:stop(Pid2);
+        {error, eafnosupport} ->
+            error_logger:info_msg("Skipping unix socket test. "
+                                  "Not supported on this OS.~n")
+    end.
+
+socket_backend_test() ->
+    case mysql:start_link([{user, ?user},
+                           {password, ?password},
+                           {tcp_options, [{inet_backend, socket}]}])
+    of
+        {ok, Pid1} ->
+            Dir = run_dir(),
+            {ok, [<<"@@socket">>], [[SockFile0]]} = mysql:query(Pid1, <<"SELECT @@socket">>),
+            SockFile = filename:join([Dir, filename:basename(SockFile0)]),
+            mysql:stop(Pid1),
+            case mysql:start_link([{host, {local, SockFile}},
+                                   {user, ?user}, {password, ?password},
+                                   {tcp_options, [{inet_backend, socket}]}]) of
+                {ok, Pid2} ->
+                    ?assertEqual({ok, [<<"1">>], [[1]]}, mysql:query(Pid2, <<"SELECT 1">>)),
+                    mysql:stop(Pid2);
+                {error, eafnotsupported} ->
+                    error_logger:info_msg("Skipping socket backend test. "
+                                          "Not supported on this OS.~n")
+            end;
+        {error, eafnosupport} ->
+            error_logger:info_msg("Skipping unix socket test. Not supported on this OS.~n")
+    end.
 
 connect_queries_failure_test() ->
     process_flag(trap_exit, true),
@@ -310,6 +402,9 @@ query_test_() ->
           {"Binary protocol",       fun () -> binary_protocol(Pid) end},
           {"FLOAT rounding",        fun () -> float_rounding(Pid) end},
           {"DECIMAL",               fun () -> decimal(Pid) end},
+          {"DECIMAL truncated",     fun () -> decimal_trunc(Pid) end},
+          {"Float as decimal",      fun () -> float_as_decimal(Pid) end},
+          {"Float as decimal(2)",   fun () -> float_as_decimal_2(Pid) end},
           {"INT",                   fun () -> int(Pid) end},
           {"BIT(N)",                fun () -> bit(Pid) end},
           {"DATE",                  fun () -> date(Pid) end},
@@ -568,8 +663,8 @@ multi_statements(Pid) ->
 
 text_protocol(Pid) ->
     ok = mysql:query(Pid, ?create_table_t),
-    ok = mysql:query(Pid, <<"INSERT INTO t (bl, f, d, dc, y, ti, ts, da, c)"
-                            " VALUES ('blob', 3.14, 3.14, 3.14, 2014,"
+    ok = mysql:query(Pid, <<"INSERT INTO t (bl, f, d, dc, ldc, y, ti, ts, da, c)"
+                            " VALUES ('blob', 3.14, 3.14, 3.14, 3.14, 2014,"
                             "'00:22:11', '2014-11-03 00:22:24', '2014-11-03',"
                             " NULL)">>),
     ?assertEqual(1, mysql:warning_count(Pid)), %% tx has no default value
@@ -579,9 +674,10 @@ text_protocol(Pid) ->
     %% select
     {ok, Columns, Rows} = mysql:query(Pid, <<"SELECT * FROM t">>),
     ?assertEqual([<<"id">>, <<"bl">>, <<"tx">>, <<"f">>, <<"d">>, <<"dc">>,
-                  <<"y">>, <<"ti">>, <<"ts">>, <<"da">>, <<"c">>], Columns),
+                  <<"ldc">>, <<"y">>, <<"ti">>, <<"ts">>, <<"da">>, <<"c">>],
+                 Columns),
     ?assertEqual([[1, <<"blob">>, <<>>, 3.14, 3.14, 3.14,
-                   2014, {0, {0, 22, 11}},
+                   <<"3.140">>, 2014, {0, {0, 22, 11}},
                    {{2014, 11, 03}, {00, 22, 24}}, {2014, 11, 03}, null]],
                  Rows),
 
@@ -590,22 +686,22 @@ text_protocol(Pid) ->
 binary_protocol(Pid) ->
     ok = mysql:query(Pid, ?create_table_t),
     %% The same queries as in the text protocol. Expect the same results.
-    {ok, Ins} = mysql:prepare(Pid, <<"INSERT INTO t (bl, tx, f, d, dc, y, ti,"
+    {ok, Ins} = mysql:prepare(Pid, <<"INSERT INTO t (bl, tx, f, d, dc, ldc, y, ti,"
                                      " ts, da, c)"
-                                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)">>),
+                                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)">>),
     %% 16#161 is the codepoint for "s with caron"; <<197, 161>> in UTF-8.
     ok = mysql:execute(Pid, Ins, [<<"blob">>, [16#161], 3.14, 3.14, 3.14,
-                                  2014, {0, {0, 22, 11}},
+                                  3.14, 2014, {0, {0, 22, 11}},
                                   {{2014, 11, 03}, {0, 22, 24}},
                                   {2014, 11, 03}, null]),
 
     {ok, Stmt} = mysql:prepare(Pid, <<"SELECT * FROM t WHERE id=?">>),
     {ok, Columns, Rows} = mysql:execute(Pid, Stmt, [1]),
     ?assertEqual([<<"id">>, <<"bl">>, <<"tx">>, <<"f">>, <<"d">>, <<"dc">>,
-                  <<"y">>, <<"ti">>,
+                  <<"ldc">>, <<"y">>, <<"ti">>,
                   <<"ts">>, <<"da">>, <<"c">>], Columns),
     ?assertEqual([[1, <<"blob">>, <<197, 161>>, 3.14, 3.14, 3.14,
-                   2014, {0, {0, 22, 11}},
+                   <<"3.140">>, 2014, {0, {0, 22, 11}},
                    {{2014, 11, 03}, {00, 22, 24}}, {2014, 11, 03}, null]],
                  Rows),
 
@@ -690,6 +786,130 @@ decimal(Pid) ->
     write_read_text_binary(Pid, <<"3.000000000000000">>, <<"3">>,
                            <<"dec16">>, <<"d">>),
     ok = mysql:query(Pid, "DROP TABLE dec16").
+
+decimal_trunc(_Pid) ->
+    %% Create another connection with log_warnings enabled.
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {log_warnings, true}]),
+    VersionStr = db_version_string(Pid),
+    ok = mysql:query(Pid, <<"USE otptest">>),
+    ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+    ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
+    ok = mysql:query(Pid, <<"CREATE TABLE `test_decimals` ("
+                            "  `id` bigint(20) unsigned NOT NULL,"
+                            "  `balance` decimal(13,4) NOT NULL,"
+                            "  PRIMARY KEY (`id`)"
+                            ") ENGINE=InnoDB;">>),
+    ok = mysql:query(Pid, <<"INSERT INTO test_decimals (id, balance)"
+                            " VALUES (1, 5000), (2, 5000), (3, 5000);">>),
+    {ok, decr} = mysql:prepare(Pid, decr, <<"UPDATE test_decimals"
+                                            " SET balance = balance - ?"
+                                            " WHERE id = ?">>),
+    %% Decimal sent as float gives truncation warning.
+    {ok, ok, [{_, LoggedWarning1}|_]} = error_logger_acc:capture(fun () ->
+        ok = mysql:execute(Pid, decr, [10.2, 1]),
+        ok = mysql:execute(Pid, decr, [10.2, 1]),
+        ok = mysql:execute(Pid, decr, [10.2, 1]),
+        ok = mysql:execute(Pid, decr, [10.2, 1])
+    end),
+    ?assertMatch("Note 1265: Data truncated for column 'balance'" ++ _,
+                 LoggedWarning1),
+    %% Decimal sent as binary gives truncation warning.
+    {ok, ok, [{_, LoggedWarning2}|_]} = error_logger_acc:capture(fun () ->
+        ok = mysql:execute(Pid, decr, [<<"10.2">>, 2]),
+        ok = mysql:execute(Pid, decr, [<<"10.2">>, 2]),
+        ok = mysql:execute(Pid, decr, [<<"10.2">>, 2]),
+        ok = mysql:execute(Pid, decr, [<<"10.2">>, 2])
+    end),
+    ?assertMatch("Note 1265: Data truncated for column 'balance'" ++ _,
+                 LoggedWarning2),
+    %% Decimal sent as DECIMAL => no warning
+    {ok, ok, MaybeWarning} = error_logger_acc:capture(fun () ->
+        ok = mysql:execute(Pid, decr, [{decimal, <<"10.2">>}, 3]),
+        ok = mysql:execute(Pid, decr, [{decimal, "10.2"}, 3]),
+        ok = mysql:execute(Pid, decr, [{decimal, 10.2}, 3]),
+        ok = mysql:execute(Pid, decr, [{decimal, 10.2}, 3]),
+        ok = mysql:execute(Pid, decr, [{decimal, 0}, 3]) % <- integer coverage
+    end),
+    ?assertMatch({ok, _, [[1, 4959.2], [2, 4959.2], [3, 4959.2]]},
+                 mysql:query(Pid, <<"SELECT id, balance FROM test_decimals">>)),
+    assert_decimal_trunctation_warning(VersionStr, MaybeWarning),
+    ok = mysql:query(Pid, "DROP TABLE test_decimals"),
+    ok = mysql:stop(Pid).
+
+assert_decimal_trunctation_warning(VersionStr, MaybeWarning) ->
+    case is_decimal_truncation_warning_expected(VersionStr) of
+        true ->
+            case MaybeWarning of
+                [] ->
+                    throw("Expecting " ++ VersionStr ++ " to emit decimal truncation warning, but it did not");
+                [{warning_msg, Msg}] ->
+                    ?assertMatch("Note 1265: Data truncated for column 'balance'" ++ _, Msg)
+            end;
+        false ->
+            case MaybeWarning  of
+                [] ->
+                    ok;
+                [{warning_msg, Msg}] ->
+                    throw("Not expecting " ++ VersionStr ++ "to emit decimal truncation warning, but got: " ++ Msg)
+            end
+    end.
+
+is_decimal_truncation_warning_expected(VersionStr) ->
+    case is_mariadb(VersionStr) of
+        true ->
+            false;
+        false ->
+            case parse_db_version(VersionStr) of
+                [8 | _] ->
+                    true;
+                [9 | _] ->
+                    true;
+                _ ->
+                    false
+            end
+    end.
+
+float_as_decimal(_Pid) ->
+    %% Create another connection with {float_as_decimal, true}
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {log_warnings, true},
+                                  {float_as_decimal, true}]),
+    ok = mysql:query(Pid, <<"USE otptest">>),
+    ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+    ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
+    ok = mysql:query(Pid, <<"CREATE TABLE float_as_decimal ("
+                            "  balance decimal(13,4) NOT NULL"
+                            ") ENGINE=InnoDB;">>),
+    ok = mysql:query(Pid, <<"INSERT INTO float_as_decimal (balance)"
+                            " VALUES (5000);">>),
+    {ok, decr} = mysql:prepare(Pid, decr, <<"UPDATE float_as_decimal"
+                                            " SET balance = balance - ?">>),
+    %% Floats sent as decimal => no truncation warning.
+    {ok, ok, []} = error_logger_acc:capture(fun () ->
+        ok = mysql:execute(Pid, decr, [10.2]),
+        ok = mysql:execute(Pid, decr, [10.2]),
+        ok = mysql:execute(Pid, decr, [10.2]),
+        ok = mysql:execute(Pid, decr, [10.2])
+    end),
+    ok = mysql:query(Pid, "DROP TABLE float_as_decimal;"),
+    ok = mysql:stop(Pid).
+
+float_as_decimal_2(_Pid) ->
+    %% Create another connection with {float_as_decimal, 2}.
+    %% Check that floats are sent as DECIMAL with 2 decimals.
+    {ok, Pid} = mysql:start_link([{user, ?user}, {password, ?password},
+                                  {log_warnings, true},
+                                  {float_as_decimal, 2}]),
+    ok = mysql:query(Pid, <<"USE otptest">>),
+    ok = mysql:query(Pid, <<"SET autocommit = 1">>),
+    ok = mysql:query(Pid, <<"SET SESSION sql_mode = ?">>, [?SQL_MODE]),
+    ok = mysql:query(Pid, <<"CREATE TABLE dec13_4 (d DECIMAL(13,4))">>),
+    ok = mysql:query(Pid, <<"INSERT INTO dec13_4 (d) VALUES (?)">>, [3.14159]),
+    {ok, _, [[Value]]} = mysql:query(Pid, <<"SELECT d FROM dec13_4">>),
+    ?assertEqual(3.14, Value),
+    ok = mysql:query(Pid, <<"DROP TABLE dec13_4">>),
+    ok = mysql:stop(Pid).
 
 int(Pid) ->
     ok = mysql:query(Pid, "CREATE TABLE ints (i INT)"),
@@ -978,7 +1198,7 @@ timeout_test_() ->
      end,
      {with, [fun (Pid) ->
                  %% SLEEP was added in MySQL 5.0.12
-                 ?assertEqual({ok, [<<"SLEEP(5)">>], [[1]]},
+                 check_sleep_timeout_result(
                               mysql:query(Pid, <<"SELECT SLEEP(5)">>, 40)),
 
                  %% A query after an interrupted query shouldn't get a timeout.
@@ -986,15 +1206,23 @@ timeout_test_() ->
                               mysql:query(Pid, <<"SELECT 42">>)),
 
                  %% Parametrized query
-                 ?assertEqual({ok, [<<"SLEEP(?)">>], [[1]]},
+                 check_sleep_timeout_result(
                               mysql:query(Pid, <<"SELECT SLEEP(?)">>, [5], 40)),
 
                  %% Prepared statement
                  {ok, Stmt} = mysql:prepare(Pid, <<"SELECT SLEEP(?)">>),
-                 ?assertEqual({ok, [<<"SLEEP(?)">>], [[1]]},
+                 check_sleep_timeout_result(
                               mysql:execute(Pid, Stmt, [5], 40)),
                  ok = mysql:unprepare(Pid, Stmt)
              end]}}.
+
+check_sleep_timeout_result({error, {1317, <<"70100">>,
+                                    <<"Query execution was ", _/binary>>}}) ->
+    %% MariaDB 10.3 on TravisCI returns this when sleep is interrupted.
+    ok;
+check_sleep_timeout_result(Result) ->
+    %% Sleep returns 1 when aborted
+    ?assertMatch({ok, [<<"SLEEP", _/binary>>], [[1]]}, Result).
 
 %% --------------------------------------------------------------------------
 
@@ -1085,3 +1313,6 @@ is_access_denied(#{cause := {1251, <<"08004">>, <<"Client does not support authe
     true; % This has been observed with MariaDB 10.3.13
 is_access_denied(_) ->
     false.
+
+get_socket_from_conn(Pid) ->
+    element(?conn_state_socket_position, sys:get_state(Pid)).

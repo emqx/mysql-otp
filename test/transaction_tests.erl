@@ -22,7 +22,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(user,     "otptest").
--define(password, "otptest").
+-define(password, "OtpTest--123").
 
 single_connection_test_() ->
     {setup,
@@ -107,7 +107,7 @@ application_process_kill() ->
 
     ?assertNot(is_process_alive(Pid)),
 
-    %% Check that the transaction was not commited
+    %% Check that the transaction was not committed
     {ok, Pid2} = mysql:start_link([
         {user, ?user},
         {password, ?password},
