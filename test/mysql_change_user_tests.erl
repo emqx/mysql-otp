@@ -22,9 +22,9 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(user1,     "otptest").
--define(password1, "otptest").
+-define(password1, "OtpTest--123").
 -define(user2,     "otptest2").
--define(password2, "otptest2").
+-define(password2, "OtpTest2--123").
 
 %% Ensure that the current user can be changed to another user
 %% when given correct credentials.
@@ -187,6 +187,12 @@ connect_db(User, Password) ->
 
 is_current_user(Pid, User) when is_binary(User) ->
     {ok, [<<"CURRENT_USER()">>], [[CurUser]]}=mysql:query(Pid, <<"SELECT CURRENT_USER()">>),
-    <<User/binary, "@%">> =:= CurUser;
+    L = size(User),
+    case CurUser of
+        <<User:L/binary, "@", _/binary>> ->
+            true;
+        _ ->
+            false
+    end;
 is_current_user(Pid, User) ->
     is_current_user(Pid, iolist_to_binary(User)).

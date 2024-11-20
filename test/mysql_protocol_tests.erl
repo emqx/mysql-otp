@@ -44,7 +44,7 @@ resultset_test() ->
     ExpectedCommunication = [{send, ExpectedReq},
                              {recv, ExpectedResponse}],
     Sock = mock_tcp:create(ExpectedCommunication),
-    {ok, [ResultSet]} = mysql_protocol:query(Query, mock_tcp, Sock, [],
+    {ok, [ResultSet]} = mysql_protocol:query(Query, mock_tcp, Sock, [], auto,
                                              no_filtermap_fun, infinity),
     mock_tcp:close(Sock),
     ?assertMatch(#resultset{cols = [#col{name = <<"@@version_comment">>}],
@@ -54,7 +54,7 @@ resultset_test() ->
 
 resultset_error_test() ->
     %% A query that returns a response starting as a result set but then
-    %% interupts itself and decides that it is an error.
+    %% interrupts itself and decides that it is an error.
     Query = <<"EXPLAIN SELECT * FROM dual;">>,
     ExpectedReq = <<(size(Query) + 1):24/little, 0, ?COM_QUERY, Query/binary>>,
     ExpectedResponse = hexdump_to_bin(
@@ -82,7 +82,7 @@ resultset_error_test() ->
         "48 04 23 48 59 30 30 30    4e 6f 20 74 61 62 6c 65    H.#HY000No table"
         "73 20 75 73 65 64                                     s used"),
     Sock = mock_tcp:create([{send, ExpectedReq}, {recv, ExpectedResponse}]),
-    {ok, [Result]} = mysql_protocol:query(Query, mock_tcp, Sock, [],
+    {ok, [Result]} = mysql_protocol:query(Query, mock_tcp, Sock, [], auto,
                                           no_filtermap_fun, infinity),
     ?assertMatch(#error{}, Result),
     mock_tcp:close(Sock),
