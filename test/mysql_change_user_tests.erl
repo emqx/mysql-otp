@@ -47,12 +47,11 @@ incorrect_credentials_fail_test() ->
         end
     end),
     erlang:process_flag(trap_exit, TrapExit),
-    ?assertMatch([{error, "Connection Id " ++ _}, % closing with reason: cha...
-                  {error, "** Generic server" ++ _},
-                  {error_report, {crash_report, _}}], Logged),
+    ?assertMatch([{error, "Connection Id " ++ _} % closing with reason: cha...
+                 ], Logged),
     ?assertMatch({error, {1045, <<"28000">>, <<"Access denied", _/binary>>}},
                  Ret),
-    ?assertEqual(change_user_failed, ExitReason),
+    ?assertEqual({shutdown, change_user_failed}, ExitReason),
     ?assertExit(noproc, mysql:stop(Pid)),
     ok.
 
@@ -143,9 +142,8 @@ execute_queries_failure_test() ->
         after 1000 -> error(no_exit_message)
         end
     end),
-    ?assertMatch([{error, "Connection Id " ++ _}, % closing with reason: {1064,
-                  {error, "** Generic server" ++ _},
-                  {error_report, {crash_report, _}}], Logged),
+    ?assertMatch([{error, "Connection Id " ++ _} % closing with reason: {1064,
+                 ], Logged),
     {error, Reason} = Ret,
     ?assertMatch({1064, <<"42000">>, <<"You have an erro", _/binary>>}, Reason),
     erlang:process_flag(trap_exit, false).
@@ -172,9 +170,8 @@ prepare_statements_failure_test() ->
        after 1000 -> error(no_exit_message)
        end
     end),
-    ?assertMatch([{error, "Connection Id " ++ _}, % closing with reason: {1064,
-                  {error, "** Generic server" ++ _},
-                  {error_report, {crash_report, _}}], Logged),
+    ?assertMatch([{error, "Connection Id " ++ _} % closing with reason: {1064,
+                 ], Logged),
     {error, Reason} = Ret,
     ?assertMatch({1064, <<"42000">>, <<"You have an erro", _/binary>>}, Reason),
     erlang:process_flag(trap_exit, false).
