@@ -129,12 +129,13 @@ init(Opts) ->
                 {ok, State1} ->
                     {ok, State1};
                 {error, Reason} ->
-                    {stop, #{cause => Reason,
-                             host => Host,
-                             port => Port,
-                             database => Database,
-                             user => User
-                            }}
+                    shutdown(#{
+                        cause => Reason,
+                        host => Host,
+                        port => Port,
+                        database => Database,
+                        user => User
+                    })
             end;
         asynchronous ->
             gen_server:cast(self(), connect),
@@ -236,7 +237,9 @@ handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
                            status = Status},
             {ok, State1};
         #error{} = E ->
-            {error, error_to_reason(E)}
+            {error, error_to_reason(E)};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 post_connect(#state{queries = Queries, prepares = Prepares} = State) ->
@@ -315,7 +318,7 @@ handle_call(Msg, From, #state{socket = undefined} = State) ->
         {ok, State1} ->
             handle_call(Msg, From, State1);
         {error, _} = E ->
-            {stop, E, State}
+            shutdown(E, State)
     end;
 handle_call({query, Query, FilterMap, Timeout}, _From, State) ->
     {Reply, State1} = query(Query, FilterMap, Timeout, State),
@@ -517,12 +520,13 @@ handle_cast(connect, #state{socket = undefined, host = Host, port = Port,
         {ok, State1} ->
             {noreply, State1};
         {error, Reason} ->
-            {stop, #{cause => Reason,
-                     host => Host,
-                     port => Port,
-                     user => User,
-                     database => Database
-                    }, State}
+            shutdown(#{
+                cause => Reason,
+                host => Host,
+                port => Port,
+                user => User,
+                database => Database
+            }, State)
     end;
 handle_cast(connect, State) ->
     {noreply, State};
@@ -554,7 +558,7 @@ handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, schedule_ping(State)};
 handle_info({SockClosed, _Socket}, State) when SockClosed =:= tcp_closed; SockClosed =:= ssl_closed ->
-    {stop, normal, State#state{socket = undefined, connection_id = undefined}};
+    shutdown(normal, State#state{socket = undefined, connection_id = undefined});
 handle_info({SockError, _Socket, Reason}, State) when SockError =:= tcp_error; SockError =:= ssl_error ->
     stop_server({SockError, Reason}, State);
 handle_info({SockType, _Socket, ErrorPacket}, #state{socket = Socket, sockmod = SockMod} = State)
@@ -816,17 +820,18 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
             mysql_protocol:quit(SockMod, Socket);
         #error{} = E ->
             error_logger:error_msg("Failed to connect to kill query: ~p",
-                                   [error_to_reason(E)])
+                                   [error_to_reason(E)]);
+        {error, Reason} ->
+            error_logger:error_msg("Failed to connect to kill query: ~p", [Reason])
     end.
 
 stop_server(Reason, #state{socket = undefined} = State) ->
-  {stop, Reason, State};
+    shutdown(Reason, State);
 stop_server(Reason,
             #state{socket = Socket, sockmod = SockMod, connection_id = ConnId} = State) ->
-  error_logger:error_msg("Connection Id ~p closing with reason: ~p~n",
-                         [ConnId, Reason]),
-  ok = SockMod:close(Socket),
-  {stop, Reason, State#state{socket = undefined, connection_id = undefined}}.
+    error_logger:error_msg("Connection Id ~p closing with reason: ~p~n", [ConnId, Reason]),
+    ok = SockMod:close(Socket),
+    shutdown(Reason, State#state{socket = undefined, connection_id = undefined}).
 
 setopts(gen_tcp, Socket, Opts) ->
     inet:setopts(Socket, Opts);
@@ -838,3 +843,14 @@ demonitor_processes(List, 0) ->
 demonitor_processes([{_FromPid, MRef}|T], Count) ->
     erlang:demonitor(MRef),
     demonitor_processes(T, Count - 1).
+
+shutdown(Reason) ->
+    {stop, wrap_shutdown(Reason)}.
+
+shutdown(Reason, State) ->
+    {stop, wrap_shutdown(Reason), State}.
+
+wrap_shutdown(normal) -> normal;
+wrap_shutdown(shutdown) -> shutdown;
+wrap_shutdown({shutdown, _} = Reason) -> Reason;
+wrap_shutdown(Reason) -> {shutdown, Reason}.

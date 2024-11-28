@@ -58,7 +58,7 @@ connect_synchronous_nxdomain_error_test() ->
                                         {password, ?password},
                                         {host, "i.dont.exist"},
                                         {connect_mode, synchronous}]),
-    ?assertMatch(#{cause := nxdomain}, Reason),
+    ?assertMatch({shutdown, #{cause := nxdomain}}, Reason),
     assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
@@ -119,7 +119,7 @@ failing_connect_test() ->
         fun () ->
             mysql:start_link([{user, "dummy"}, {password, "junk"}])
         end),
-    ?assertMatch([_|_], Logged), % some errors logged
+    ?assertMatch([], Logged), % we suppress the crash reports
     {error, Error} = Ret,
     true = is_access_denied(Error),
     assert_init_exit(Error),
@@ -197,19 +197,14 @@ tcp_error_test() ->
         %% Simulate a tcp error by sending a message. (Is there a better way?)
         Pid ! {tcp_error, dummy_socket, tcp_reason},
         receive
-            {'EXIT', Pid, {tcp_error, tcp_reason}} -> ok
+            {'EXIT', Pid, {shutdown, {tcp_error, tcp_reason}}} -> ok
         after 1000 ->
             error(no_exit_message)
         end
     end),
     process_flag(trap_exit, false),
     %% Check that we got the expected crash report in the error log.
-    [{error, Msg1}, {error, Msg2}, {error_report, CrashReport}] = LoggedErrors,
-    %% "Connection Id 24 closing with reason: tcp_closed"
-    ?assert(lists:prefix("Connection Id", Msg1)),
-    ExpectedPrefix = io_lib:format("** Generic server ~p terminating", [Pid]),
-    ?assert(lists:prefix(lists:flatten(ExpectedPrefix), Msg2)),
-    ?assertMatch({crash_report, _}, CrashReport).
+    ?assertMatch([{error, "Connection Id" ++ _}], LoggedErrors).
 
 keep_alive_test() ->
      %% Let the connection send a few pings.
@@ -224,7 +219,7 @@ keep_alive_test() ->
          receive
             Message -> Message
          after 1000 ->
-             ping_didnt_crash_connection
+            ping_didnt_crash_connection
          end
      end),
      process_flag(trap_exit, false),
@@ -257,7 +252,7 @@ connect_queries_failure_test() ->
             mysql:start_link([{user, ?user}, {password, ?password},
                               {queries, ["foo"]}])
         end),
-    ?assertMatch([{error_report, {crash_report, _}}], Logged),
+    ?assertMatch([], Logged),
     {error, Reason} = Ret,
     assert_init_exit(Reason),
     process_flag(trap_exit, false).
@@ -270,9 +265,9 @@ connect_prepare_failure_test() ->
                               {password, ?password},
                               {prepare, [{foo, "foo"}]}])
         end),
-    ?assertMatch([{error_report, {crash_report, _}}], Logged),
+    ?assertMatch([], Logged),
     {error, Reason} = Ret,
-    ?assertMatch(#{cause := {1064, <<"42000">>, <<"You have an erro", _/binary>>}}, Reason),
+    ?assertMatch({shutdown, #{cause := {1064, <<"42000">>, <<"You have an erro", _/binary>>}}}, Reason),
     assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
@@ -1076,6 +1071,8 @@ parse_db_version(Version) ->
   lists:map(fun binary_to_integer/1,
             binary:split(Version1, <<".">>, [global])).
 
+is_access_denied({shutdown, Reason}) ->
+    is_access_denied(Reason);
 is_access_denied(#{cause := {1045, <<"28000">>, <<"Access denie", _/binary>>}}) ->
     true; % MySQL 5.x, etc.
 is_access_denied(#{cause := {1698, <<"28000">>, <<"Access denie", _/binary>>}}) ->

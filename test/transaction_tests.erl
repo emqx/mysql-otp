@@ -94,16 +94,15 @@ application_process_kill() ->
     {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
         exit(AppPid, kill),
         receive
-            {'DOWN', Mref, process, Pid, {application_process_died, AppPid}} ->
+            {'DOWN', Mref, process, Pid, {shutdown, {application_process_died, AppPid}}} ->
                 ok
         after 10000 ->
             throw(too_long)
         end
     end),
     %% Check that we got the expected error log noise
-    ?assertMatch([{error, "Connection Id" ++ _},     %% from mysql_conn
-                  {error, "** Generic server" ++ _}, %% from gen_server
-                  {error_report, _}], LoggedErrors),
+    ?assertMatch([{error, "Connection Id" ++ _} %% from mysql_conn
+                 ], LoggedErrors),
 
     ?assertNot(is_process_alive(Pid)),
 
