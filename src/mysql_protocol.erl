@@ -77,24 +77,27 @@
                 Socket :: term(),
                 SetFoundRows :: boolean()) ->
     {ok, #handshake{}, SockModule :: module(), Socket :: term()} |
-    #error{}.
+    #error{} | {error, term()}.
 
 handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
           SetFoundRows) ->
     SeqNum0 = 0,
-    {ok, HandshakePacket, SeqNum1} = recv_packet(SockModule0, Socket0, SeqNum0),
-    case parse_handshake(HandshakePacket) of
-        #handshake{} = Handshake ->
-            {ok, SockModule, Socket, SeqNum2} =
-                maybe_do_ssl_upgrade(Host, SockModule0, Socket0, SeqNum1, Handshake,
-                                     SSLOpts, Database, SetFoundRows),
-            Response = build_handshake_response(Handshake, Username, Password,
-                                                Database, SetFoundRows),
-            {ok, SeqNum3} = send_packet(SockModule, Socket, Response, SeqNum2),
-            handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket,
-                                            SeqNum3);
-        #error{} = Error ->
-            Error
+    case recv_packet(SockModule0, Socket0, SeqNum0) of
+        {error, Reason} -> {error, Reason};
+        {ok, HandshakePacket, SeqNum1} ->
+            case parse_handshake(HandshakePacket) of
+                #handshake{} = Handshake ->
+                    {ok, SockModule, Socket, SeqNum2} =
+                        maybe_do_ssl_upgrade(Host, SockModule0, Socket0, SeqNum1, Handshake,
+                                            SSLOpts, Database, SetFoundRows),
+                    Response = build_handshake_response(Handshake, Username, Password,
+                                                        Database, SetFoundRows),
+                    {ok, SeqNum3} = send_packet(SockModule, Socket, Response, SeqNum2),
+                    handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket,
+                                                    SeqNum3);
+                #error{} = Error ->
+                    Error
+            end
     end.
 
 

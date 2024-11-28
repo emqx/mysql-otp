@@ -237,7 +237,9 @@ handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
                            status = Status},
             {ok, State1};
         #error{} = E ->
-            {error, error_to_reason(E)}
+            {error, error_to_reason(E)};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 post_connect(#state{queries = Queries, prepares = Prepares} = State) ->
@@ -818,7 +820,9 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
             mysql_protocol:quit(SockMod, Socket);
         #error{} = E ->
             error_logger:error_msg("Failed to connect to kill query: ~p",
-                                   [error_to_reason(E)])
+                                   [error_to_reason(E)]);
+        {error, Reason} ->
+            error_logger:error_msg("Failed to connect to kill query: ~p", [Reason])
     end.
 
 stop_server(Reason, #state{socket = undefined} = State) ->
