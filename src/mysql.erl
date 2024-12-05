@@ -1,5 +1,5 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
-%% Copyright (C) 2014-2015, 2018 Viktor Söderqvist,
+%% Copyright (C) 2014-2015, 2018, 2021 Viktor Söderqvist,
 %%               2016 Johan Lövdahl
 %%               2017 Piotr Nosek, Michal Slaski
 %%
@@ -37,7 +37,8 @@
 
 -export_type([option/0, connection/0, query/0, statement_name/0,
               statement_ref/0, query_param/0, query_filtermap_fun/0,
-              query_result/0, transaction_result/1, server_reason/0]).
+              query_result/0, transaction_result/1, server_reason/0,
+              decode_decimal/0]).
 
 %% A connection is a ServerRef as in gen_server:call/2,3.
 -type connection() :: Name :: atom() |
@@ -65,10 +66,12 @@
 -type statement_name() :: atom() | binary().
 -type statement_ref() :: statement_id() | statement_name().
 
+-type decode_decimal() :: auto | binary | float | number.
+
 -type query_result() :: ok
                       | {ok, [column_name()], [row()]}
                       | {ok, [{[column_name()], [row()]}, ...]}
-                      | {error, server_reason()}.
+                      | {error, server_reason() | busy}.
 
 -type transaction_result(Result) :: {atomic, Result} | {aborted, Reason :: term()}.
 
@@ -92,9 +95,9 @@
                 | {found_rows, boolean()}
                 | {query_cache_time, non_neg_integer()}
                 | {tcp_options, [gen_tcp:connect_option()]}
-                | {ssl, term()}.
-
--include("exception.hrl").
+                | {ssl, term()}
+                | {float_as_decimal, boolean() | non_neg_integer()}
+                | {decode_decimal, decode_decimal()}.
 
 %% @doc Starts a connection gen_server process and connects to a database. To
 %% disconnect use `mysql:stop/1,2'.
@@ -151,10 +154,10 @@
 %%       The default is an empty list, meaning the client will not send any
 %%       local files to the server.</dd>
 %%   <dt>`{log_warnings, boolean()}'</dt>
-%%   <dd>Whether to fetch warnings and log them using error_logger; default
+%%   <dd>Whether to fetch warnings and log them using logger; default
 %%       true.</dd>
 %%   <dt>`{log_slow_queries, boolean()}'</dt>
-%%   <dd>Whether to log slow queries using error_logger; default false. Queries
+%%   <dd>Whether to log slow queries using logger; default false. Queries
 %%       are flagged as slow by the server if their execution time exceeds the
 %%       value in the `long_query_time' variable.</dd>
 %%   <dt>`{keep_alive, boolean() | timeout()}'</dt>
@@ -192,6 +195,19 @@
 %%       The `server_name_indication' option, if omitted, defaults to the value
 %%       of the `host' option if it is a hostname string, otherwise no default
 %%       value is set.</dd>
+%%   <dt>`{float_as_decimal, boolean() | non_neg_integer()}'</dt>
+%%   <dd>Encode floats as decimals when sending parameters for parametrized
+%%       queries and prepared statements to the server. This prevents float
+%%       rounding and truncation errors from happening on the server side. If a
+%%       number is specified, the float is rounded to this number of
+%%       decimals. This is off (false) by default.</dd>
+%%   <dt>`{decode_decimal, auto | float | number | binary}'</dt>
+%%   <dd>When decoding `decimal' columns from the server, force the return the
+%%       value as either a `binary()', `float()`, or `number()' (specified by
+%%       the atoms `binary', `float', `number' respectively). Defaults to
+%%       `auto', which will return a number (`integer()' or `float()') unless
+%%       the conversion to `float()' would result in a loss of precision, in
+%%       which case, `binary()' is returned.</dd>
 %% </dl>
 -spec start_link(Options :: [option()]) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Options) ->
@@ -221,30 +237,7 @@ stop(Conn) ->
     when Conn :: connection(),
          Timeout :: timeout().
 stop(Conn, Timeout) ->
-    case erlang:function_exported(gen_server, stop, 3) of
-        true -> gen_server:stop(Conn, normal, Timeout);            %% OTP >= 18
-        false -> backported_gen_server_stop(Conn, normal, Timeout) %% OTP < 18
-    end.
-
--spec backported_gen_server_stop(Conn, Reason, Timeout) -> ok
-    when Conn :: connection(),
-         Reason :: term(),
-         Timeout :: timeout().
-backported_gen_server_stop(Conn, Reason, Timeout) ->
-    Monitor=monitor(process, Conn),
-    exit(Conn, Reason),
-    receive
-        {'DOWN', Monitor, process, Conn, Reason} ->
-            ok;
-        {'DOWN', Monitor, process, Conn, UnexpectedReason} ->
-            exit(UnexpectedReason)
-    after Timeout ->
-        exit(Conn, kill),
-        receive
-            {'DOWN', Monitor, process, Conn, killed} ->
-                exit(timeout)
-        end
-    end.
+    gen_server:stop(Conn, normal, Timeout).
 
 %% @private
 -spec is_connected(Conn) -> boolean()
@@ -358,6 +351,9 @@ query(Conn, Query, Params, FilterMap) when (Params == no_params orelse
 %%
 %% For queries that don't return any rows (INSERT, UPDATE, etc.) only the atom
 %% `ok' is returned.
+%%
+%% If this function is called on a connection which is already in transaction 
+%% owned by another process, `{error, busy}` will be returned.
 %%
 %% === FilterMap details ===
 %%
@@ -491,6 +487,9 @@ execute(Conn, StatementRef, Params, FilterMap) when FilterMap == no_filtermap_fu
 %%
 %% See `query/5' for an explanation of the `FilterMap' argument.
 %%
+%% Note that if this function is called on a connection which is already in transaction 
+%% owned by another process, `{error, busy}' will be returned.
+%%
 %% @see prepare/2
 %% @see prepare/3
 %% @see prepare/4
@@ -611,6 +610,11 @@ transaction(Conn, Fun, Retries) ->
 %% can be nested and are restarted automatically when deadlocks are detected.
 %% MySQL's savepoints are used to implement nested transactions.
 %%
+%% If this function is called on a connection which is already in a transaction
+%% owned by another process, `{aborted, busy}` is returned. The idea of nested
+%% transactions is that this function can be called in the Fun, but all within
+%% the same process.
+%%
 %% Fun must be a function and Args must be a list of the same length as the
 %% arity of Fun.
 %%
@@ -623,7 +627,7 @@ transaction(Conn, Fun, Retries) ->
 %% using e.g. `ok = mysql:query(Pid, "SELECT some_non_existent_value")'. An
 %% exception to this is the error 1213 "Deadlock", after the specified number
 %% of retries, all failed. In this case, the transaction is aborted and the
-%% error is retured as the reason for the aborted transaction, along with a
+%% error is returned as the reason for the aborted transaction, along with a
 %% stacktrace pointing to where the last deadlock was detected. (In earlier
 %% versions, up to and including 1.3.2, transactions where automatically
 %% restarted also for the error 1205 "Lock wait timeout". This is no longer the
@@ -658,8 +662,12 @@ transaction(Conn, Fun, Args, Retries) when is_list(Args),
                                            is_function(Fun, length(Args)) ->
     %% The guard makes sure that we can apply Fun to Args. Any error we catch
     %% in the try-catch are actual errors that occurred in Fun.
-    ok = gen_server:call(Conn, start_transaction, infinity),
-    execute_transaction(Conn, Fun, Args, Retries).
+    case gen_server:call(Conn, start_transaction, infinity) of
+        ok -> 
+            execute_transaction(Conn, Fun, Args, Retries);
+        {error, busy} ->
+            {aborted, busy}
+    end.        
 
 %% @private
 %% @doc This is a helper for transaction/2,3,4. It performs everything except
@@ -691,59 +699,58 @@ execute_transaction(Conn, Fun, Args, Retries) ->
     catch
         %% We are at the top level, try to restart the transaction if there are
         %% retries left
-        ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
+        throw:{implicit_rollback, 1, _}
           when Retries == infinity ->
             %% In MySQL < 5.7 we're not in a transaction here, but in earlier
             %% versions we are, so we can't use `gen_server:call(Conn,
             %% start_transaction, infinity)' here.
             ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, infinity);
-        ?EXCEPTION(throw, {implicit_rollback, 1, _}, _Stacktrace)
+        throw:{implicit_rollback, 1, _}
           when Retries > 0 ->
             ok = query(Conn, <<"BEGIN">>),
             execute_transaction(Conn, Fun, Args, Retries - 1);
-        ?EXCEPTION(throw, {implicit_rollback, 1, Reason}, Stacktrace)
+        throw:{implicit_rollback, 1, Reason}:Stacktrace
           when Retries == 0 ->
             %% No more retries. Return 'aborted' along with the deadlock error
-            %% and a the trace to the line where the deadlock occured.
-            Trace = ?GET_STACK(Stacktrace),
+            %% and a the trace to the line where the deadlock occurred.
             %% In MySQL < 5.7, we are still in a transaction here, but in 5.7+
             %% we're not.  The ROLLBACK executed here has no effect if no
             %% transaction is ongoing.
             ok = gen_server:call(Conn, rollback, infinity),
-            {aborted, {Reason, Trace}};
-        ?EXCEPTION(throw, {implicit_rollback, N, Reason}, Stacktrace)
+            {aborted, {Reason, Stacktrace}};
+        throw:{implicit_rollback, N, Reason}:Stacktrace
           when N > 1 ->
             %% Nested transaction. Bubble out to the outermost level.
             erlang:raise(throw, {implicit_rollback, N - 1, Reason},
-                         ?GET_STACK(Stacktrace));
-        ?EXCEPTION(error, {implicit_commit, _Query} = E, Stacktrace) ->
+                         Stacktrace);
+        error:{implicit_commit, _Query} = E:Stacktrace ->
             %% The called did something like ALTER TABLE which resulted in an
             %% implicit commit. The server has already committed. We need to
             %% jump out of N levels of transactions.
             %%
             %% Returning 'atomic' or 'aborted' would both be wrong. Raise an
             %% exception is the best we can do.
-            erlang:raise(error, E, ?GET_STACK(Stacktrace));
-        ?EXCEPTION(error, change_user_in_transaction = E, Stacktrace) ->
+            erlang:raise(error, E, Stacktrace);
+        error:change_user_in_transaction = E:Stacktrace ->
             %% The called tried to change user inside the transaction, which
             %% is not allowed and a serious mistake. We roll back and raise
             %% an error.
             ok = gen_server:call(Conn, rollback, infinity),
-            erlang:raise(error, E, ?GET_STACK(Stacktrace));
-        ?EXCEPTION(error, reset_connection_in_transaction = E, Stacktrace) ->
+            erlang:raise(error, E, Stacktrace);
+        error:reset_connection_in_transaction = E:Stacktrace ->
             %% The called tried to reset connection inside the transaction, which
             %% is not allowed and a serious mistake. We roll back and raise
             %% an error.
             ok = gen_server:call(Conn, rollback, infinity),
-            erlang:raise(error, E, ?GET_STACK(Stacktrace));
-        ?EXCEPTION(Class, Reason, Stacktrace) ->
+            erlang:raise(error, E, Stacktrace);
+        Class:Reason:Stacktrace ->
             %% We must be able to rollback. Otherwise let's crash.
             ok = gen_server:call(Conn, rollback, infinity),
             %% These forms for throw, error and exit mirror Mnesia's behaviour.
             Aborted = case Class of
                 throw -> {throw, Reason};
-                error -> {Reason, ?GET_STACK(Stacktrace)};
+                error -> {Reason, Stacktrace};
                 exit  -> Reason
             end,
             {aborted, Aborted}

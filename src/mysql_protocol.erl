@@ -1,5 +1,5 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
-%% Copyright (C) 2014 Viktor Söderqvist
+%% Copyright (C) 2014-2021 Viktor Söderqvist
 %%               2017 Piotr Nosek, Michal Slaski
 %%
 %% This file is part of MySQL/OTP.
@@ -28,8 +28,8 @@
 -module(mysql_protocol).
 
 -export([handshake/8, change_user/8, quit/2, ping/2,
-         query/6, fetch_query_response/5, prepare/3, unprepare/3,
-         execute/7, fetch_execute_response/5, reset_connnection/2,
+         query/7, fetch_query_response/6, prepare/3, unprepare/3,
+         execute/8, fetch_execute_response/6, reset_connnection/2,
          valid_params/1, valid_path/1]).
 
 -export([maybe_parse_error_packet/1]).
@@ -39,6 +39,8 @@
 -type auth_more_data() :: fast_auth_completed
                         | full_auth_requested
                         | {public_key, term()}.
+
+-type decode_decimal() :: mysql:decode_decimal().
 
 %% How much data do we want per packet?
 -define(MAX_BYTES_PER_PACKET, 16#1000000).
@@ -177,7 +179,7 @@ auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
             auth_finish_or_switch(AuthPluginName, AuthPluginData, Password, SockModule,
                                   Socket, ServerVersion, SeqNum2);
         {public_key, PubKey} ->
-            %% Serveri has sent its public key (certainly specific to the caching_sha2_password
+            %% Server has sent its public key (certainly specific to the caching_sha2_password
             %% method). We encrypt the password with the public key we received and send
             %% it back to the server.
             EncryptedPassword = encrypt_password(Password, AuthPluginData, PubKey,
@@ -204,19 +206,19 @@ ping(SockModule, Socket) ->
     {ok, OkPacket, _SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     parse_ok_packet(OkPacket).
 
--spec query(Query :: iodata(), module(), term(), [binary()], query_filtermap(),
-            timeout()) ->
-    {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
-query(Query, SockModule, Socket, AllowedPaths, FilterMap, Timeout) ->
+-spec query(Query :: iodata(), module(), term(), [binary()],
+            decode_decimal(), query_filtermap(), timeout()) ->
+    {ok, [#ok{} | #resultset{} | #error{}]} | {error, term()}.
+query(Query, SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout) ->
     Req = <<?COM_QUERY, (iolist_to_binary(Query))/binary>>,
     SeqNum0 = 0,
     {ok, _SeqNum1} = send_packet(SockModule, Socket, Req, SeqNum0),
-    fetch_query_response(SockModule, Socket, AllowedPaths, FilterMap, Timeout).
+    fetch_query_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout).
 
 %% @doc This is used by query/4. If query/4 returns {error, timeout}, this
 %% function can be called to retry to fetch the results of the query.
-fetch_query_response(SockModule, Socket, AllowedPaths, FilterMap, Timeout) ->
-    fetch_response(SockModule, Socket, Timeout, text, AllowedPaths, FilterMap, []).
+fetch_query_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout) ->
+    fetch_response(SockModule, Socket, Timeout, text, AllowedPaths, DecodeDecimal, FilterMap, []).
 
 %% @doc Prepares a statement.
 -spec prepare(iodata(), module(), term()) -> #error{} | #prepared{}.
@@ -262,10 +264,10 @@ unprepare(#prepared{statement_id = Id}, SockModule, Socket) ->
 
 %% @doc Executes a prepared statement.
 -spec execute(#prepared{}, [term()], module(), term(), [binary()],
-              query_filtermap(), timeout()) ->
-    {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
+              decode_decimal(), query_filtermap(), timeout()) ->
+    {ok, [#ok{} | #resultset{} | #error{}]} | {error, term()}.
 execute(#prepared{statement_id = Id, param_count = ParamCount}, ParamValues,
-        SockModule, Socket, AllowedPaths, FilterMap, Timeout)
+        SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout)
   when ParamCount == length(ParamValues) ->
     %% Flags Constant Name
     %% 0x00 CURSOR_TYPE_NO_CURSOR
@@ -293,12 +295,12 @@ execute(#prepared{statement_id = Id, param_count = ParamCount}, ParamValues,
             iolist_to_binary([Req1, TypesAndSigns, EncValues])
     end,
     {ok, _SeqNum1} = send_packet(SockModule, Socket, Req, 0),
-    fetch_execute_response(SockModule, Socket, AllowedPaths, FilterMap, Timeout).
+    fetch_execute_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout).
 
 %% @doc This is used by execute/5. If execute/5 returns {error, timeout}, this
 %% function can be called to retry to fetch the results of the query.
-fetch_execute_response(SockModule, Socket, AllowedPaths, FilterMap, Timeout) ->
-    fetch_response(SockModule, Socket, Timeout, binary, AllowedPaths, FilterMap, []).
+fetch_execute_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap, Timeout) ->
+    fetch_response(SockModule, Socket, Timeout, binary, AllowedPaths, DecodeDecimal, FilterMap, []).
 
 %% @doc Changes the user of the connection.
 -spec change_user(module(), term(), iodata(), iodata(), binary(), binary(),
@@ -369,7 +371,9 @@ parse_handshake(<<10, Rest/binary>>) ->
         <<AuthPluginNameTrimmed:L/binary, 0>> -> AuthPluginNameTrimmed;
         _ -> AuthPluginName
     end,
-    #handshake{server_version = server_version_to_list(ServerVersion),
+    {Vendor, Version} = get_server_info(ServerVersion),
+    #handshake{server_vendor = Vendor,
+               server_version = Version,
                connection_id = ConnectionId,
                capabilities = Capabilities,
                character_set = CharacterSet,
@@ -382,6 +386,24 @@ parse_handshake(<<?ERROR, ErrNo:16/little, Msg/binary>>) ->
     #error{code = ErrNo, msg = Msg};
 parse_handshake(<<Protocol:8, _/binary>>) when Protocol /= 10 ->
     error(unknown_protocol).
+
+%% @doc Detects server vendor and version from a version string.
+-spec get_server_info(binary()) -> {mysql | mariadb, [integer()]}.
+get_server_info(<<"5.5.5-", Rest/binary>>) ->
+    %% Iff the version string starts with "5.5.5-", it is MariaDB>=10.
+    %% The real version follows after the "5.5.5-" prefix.
+    %% https://mariadb.com/kb/en/connection/#initial-handshake-packet
+    {mariadb, server_version_to_list(Rest)};
+get_server_info(ServerVersion) ->
+    Version = server_version_to_list(ServerVersion),
+    Vendor = case Version of
+        [5, 1|_] -> mysql; %% There is both MySQL and MariaDB 5.1; we assume it is MySQL
+        [5, 2|_] -> mariadb; %% There is no MySQL 5.2
+        [5, 3|_] -> mariadb; %% There is no MySQL 5.3
+        [5, 5|_] -> mysql; %% There is both MySQL and MariaDB 5.5; we assume it is MySQL
+        _ -> mysql %% Everything else is definitely MySQL
+    end,
+    {Vendor, Version}.
 
 %% @doc Converts a version on the form `<<"5.6.21">' to a list `[5, 6, 21]'.
 -spec server_version_to_list(binary()) -> [integer()].
@@ -404,19 +426,24 @@ server_version_to_list(ServerVersion) ->
 maybe_do_ssl_upgrade(_Host, SockModule0, Socket0, SeqNum1, _Handshake,
                      undefined, _Database, _SetFoundRows) ->
     {ok, SockModule0, Socket0, SeqNum1};
+maybe_do_ssl_upgrade(_Host, _SockModule0, _Socket0, _SeqNum1,
+                     #handshake{capabilities=Caps},_SSLOpts, _Database,
+                     _SetFoundRows) when Caps band ?CLIENT_SSL =/= ?CLIENT_SSL ->
+    exit({failed_to_upgrade_socket, ssl_not_supported});
 maybe_do_ssl_upgrade(Host, gen_tcp, Socket0, SeqNum1, Handshake, SSLOpts,
                      Database, SetFoundRows) ->
     Response = build_handshake_response(Handshake, Database, SetFoundRows),
     {ok, SeqNum2} = send_packet(gen_tcp, Socket0, Response, SeqNum1),
-    case ssl_connect(Host, Socket0, SSLOpts, 5000) of
+    case ssl_connect(Handshake, Host, Socket0, SSLOpts, 5000) of
         {ok, SSLSocket} ->
             {ok, ssl, SSLSocket, SeqNum2};
         {error, Reason} ->
             exit({failed_to_upgrade_socket, Reason})
     end.
 
-ssl_connect(Host, Port, ConfigSSLOpts, Timeout) ->
-    DefaultSSLOpts0 = [{verify, verify_peer} | defaults_ssl_versions()],
+ssl_connect(Handshake, Host, Port, ConfigSSLOpts, Timeout) ->
+    SSLVersions = determine_ssl_versions(Handshake),
+    DefaultSSLOpts0 = [{versions, SSLVersions}, {verify, verify_peer}],
     DefaultSSLOpts1 = case is_list(Host) andalso inet:parse_address(Host) of
         false -> DefaultSSLOpts0;
         {ok, _} -> DefaultSSLOpts0;
@@ -426,11 +453,16 @@ ssl_connect(Host, Port, ConfigSSLOpts, Timeout) ->
     MergedSSLOpts = merge_ssl_options(DefaultSSLOpts1, MandatorySSLOpts, ConfigSSLOpts),
     ssl:connect(Port, MergedSSLOpts, Timeout).
 
-defaults_ssl_versions() ->
-    Ciphers = lists:concat([ssl:cipher_suites(all, V) ||
-                            V <- ?DEFAINE_SSL_VERSIONS]),
-    [{versions, ?DEFAINE_SSL_VERSIONS},
-     {ciphers, Ciphers}].
+
+%% @doc Determines which ssl versions to use according to server vendor and version
+%% since almostly, mysql &lt; 5.7.0 and mariadb &lt; 10.1.0 supports only tlsv1
+-spec determine_ssl_versions(#handshake{}) -> list().
+determine_ssl_versions(#handshake{server_vendor = mysql, server_version = Version}) when Version < [5, 7, 0] ->
+    [tlsv1];
+determine_ssl_versions(#handshake{server_vendor = mariadb, server_version = Version}) when Version < [10, 1, 0] ->
+    [tlsv1];
+determine_ssl_versions(_) ->
+    proplists:get_value(available, ssl:versions()).
 
 -spec merge_ssl_options(list(), list(), list()) -> list().
 merge_ssl_options(DefaultSSLOpts, MandatorySSLOpts, ConfigSSLOpts) ->
@@ -470,8 +502,9 @@ build_handshake_response(Handshake, Username, Password, Database,
     %% the client wants to do. The server doesn't say it handles them although
     %% it does. (http://bugs.mysql.com/bug.php?id=42268)
     ClientCapabilityFlags = add_client_capabilities(CapabilityFlags),
-    Hash = hash_password(Handshake#handshake.auth_plugin_name, Password,
-                         Handshake#handshake.auth_plugin_data),
+    AuthPluginName = Handshake#handshake.auth_plugin_name,
+    AuthPluginData = Handshake#handshake.auth_plugin_data,
+    Hash = hash_password(AuthPluginName, Password, AuthPluginData),
     HashLength = size(Hash),
     CharacterSet = character_set(Handshake#handshake.server_version),
     UsernameUtf8 = unicode:characters_to_binary(Username),
@@ -482,12 +515,15 @@ build_handshake_response(Handshake, Username, Password, Database,
     <<ClientCapabilityFlags:32/little,
       ?MAX_BYTES_PER_PACKET:32/little,
       CharacterSet:8,
-      0:23/unit:8, %% reserverd
+      0:23/unit:8, %% reserved
       UsernameUtf8/binary,
       0, %% NUL-terminator for the username
       HashLength,
       Hash/binary,
-      DbBin/binary>>.
+      DbBin/binary,
+      AuthPluginName/binary,
+      0 %% NUL-terminator for the auth_plugin_name
+      >>.
 
 -spec verify_server_capabilities(Handshake :: #handshake{},
                                  CapabilityFlags :: integer()) ->
@@ -566,9 +602,9 @@ parse_handshake_confirm(<<?MORE_DATA, MoreData/binary>>) ->
 %% either the text format (for plain queries) or the binary format (for
 %% prepared statements).
 -spec fetch_response(module(), term(), timeout(), text | binary, [binary()],
-                     query_filtermap(), list()) ->
-    {ok, [#ok{} | #resultset{} | #error{}]} | {error, timeout}.
-fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, FilterMap, Acc) ->
+                     decode_decimal(), query_filtermap(), list()) ->
+    {ok, [#ok{} | #resultset{} | #error{}]} | {error, term()}.
+fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, DecodeDecimal, FilterMap, Acc) ->
     case recv_packet(SockModule, Socket, Timeout, any) of
         {ok, ?local_infile_pattern = Packet, SeqNum2} ->
             Filename = parse_local_infile_packet(Packet),
@@ -587,7 +623,7 @@ fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, FilterMap, Acc)
                     [#error{code = -2, msg = ErrorMsg}|Acc]
             end,
             fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths,
-                           FilterMap, Acc1);
+                           DecodeDecimal, FilterMap, Acc1);
         {ok, Packet, SeqNum2} ->
             Result = case Packet of
                 ?ok_pattern ->
@@ -598,30 +634,32 @@ fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, FilterMap, Acc)
                     %% The first packet in a resultset is only the column count.
                     {ColCount, <<>>} = lenenc_int(ResultPacket),
                     fetch_resultset(SockModule, Socket, ColCount, Proto,
-                                    FilterMap, SeqNum2)
+                                    DecodeDecimal, FilterMap, SeqNum2)
             end,
             Acc1 = [Result | Acc],
             case more_results_exists(Result) of
                 true ->
                     fetch_response(SockModule, Socket, Timeout, Proto,
-                                   AllowedPaths, FilterMap, Acc1);
+                                   AllowedPaths, DecodeDecimal, FilterMap, Acc1);
                 false ->
                     {ok, lists:reverse(Acc1)}
             end;
-        {error, timeout} ->
-            {error, timeout}
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% @doc Fetches a result set.
 -spec fetch_resultset(module(), term(), integer(), text | binary,
-                      query_filtermap(), integer()) ->
+                      decode_decimal(), query_filtermap(), integer()) ->
     #resultset{} | #error{}.
-fetch_resultset(SockModule, Socket, FieldCount, Proto, FilterMap, SeqNum0) ->
+fetch_resultset(SockModule, Socket, FieldCount, Proto, DecodeDecimal, FilterMap, SeqNum0) ->
     {ok, ColDefs0, SeqNum1} = fetch_column_definitions(SockModule, Socket,
                                                        SeqNum0, FieldCount, []),
     {ok, DelimPacket, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
     #eof{} = parse_eof_packet(DelimPacket),
-    ColDefs1 = lists:map(fun parse_column_definition/1, ColDefs0),
+    ColDefs1 = lists:map(fun(ColDef) ->
+                                 parse_column_definition(ColDef, DecodeDecimal)
+                         end, ColDefs0),
     case fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs1, Proto,
                               FilterMap, SeqNum2, []) of
         {ok, Rows, _SeqNum3, #eof{status = S, warning_count = W}} ->
@@ -646,7 +684,7 @@ fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs, Proto,
             Eof = parse_eof_packet(Packet),
             {ok, lists:reverse(Acc), SeqNum1, Eof};
         RowPacket ->
-            Row0=decode_row(FieldCount, ColDefs, RowPacket, Proto),
+            Row0 = decode_row(FieldCount, ColDefs, RowPacket, Proto),
             Acc1 = case filtermap_resultset_row(FilterMap, ColDefs, Row0) of
                 false ->
                     Acc;
@@ -689,7 +727,7 @@ fetch_column_definitions(_SockModule, _Socket, SeqNum, 0, Acc) ->
     {ok, lists:reverse(Acc), SeqNum}.
 
 %% Parses a packet containing a column definition (part of a result set)
-parse_column_definition(Data) ->
+parse_column_definition(Data, DecodeDecimal) ->
     {<<"def">>, Rest1} = lenenc_str(Data),   %% catalog (always "def")
     {_Schema, Rest2} = lenenc_str(Rest1),    %% schema-name
     {_Table, Rest3} = lenenc_str(Rest2),     %% virtual table-name
@@ -711,7 +749,7 @@ parse_column_definition(Data) ->
     %% }
     <<>> = Rest8,
     #col{name = Name, type = Type, charset = Charset, length = Length,
-         decimals = Decimals, flags = Flags}.
+         decimals = Decimals, flags = Flags, decode_decimal = DecodeDecimal}.
 
 %% @doc Decodes a row using either the text or binary format.
 -spec decode_row(integer(), [#col{}], binary(), text | binary) -> [term()].
@@ -760,11 +798,12 @@ decode_text(#col{type = T}, Text)
 decode_text(#col{type = ?TYPE_BIT, length = Length}, Text) ->
     %% Convert to <<_:Length/bitstring>>
     decode_bitstring(Text, Length);
-decode_text(#col{type = T, decimals = S, length = L}, Text)
+decode_text(#col{type = T, decimals = S, length = L,
+                 decode_decimal = DecodeDecimal}, Text)
   when T == ?TYPE_DECIMAL; T == ?TYPE_NEWDECIMAL ->
     %% Length is the max number of symbols incl. dot and minus sign, e.g. the
     %% number of digits plus 2.
-    decode_decimal(Text, L - 2, S);
+    decode_decimal(DecodeDecimal, Text, L - 2, S);
 decode_text(#col{type = ?TYPE_DATE},
             <<Y:4/binary, "-", M:2/binary, "-", D:2/binary>>) ->
     {binary_to_integer(Y), binary_to_integer(M), binary_to_integer(D)};
@@ -847,7 +886,7 @@ decode_binary_row_acc([ColDef | ColDefs], <<0:1, NullBitMap/bitstring>>, Data,
     %% Not NULL
     {Term, Rest} = decode_binary(ColDef, Data),
     decode_binary_row_acc(ColDefs, NullBitMap, Rest, [Term | Acc]);
-decode_binary_row_acc([], _, <<>>, Acc) ->
+decode_binary_row_acc([], _NullBitMap, <<>>, Acc) ->
     lists:reverse(Acc).
 
 %% @doc Decodes a null bitmap as stored by MySQL and returns it in a strait
@@ -883,7 +922,7 @@ null_bitmap_encode(NullBitstring, BitOffset) ->
 reverse_byte(<<A:1, B:1, C:1, D:1, E:1, F:1, G:1, H:1>>) ->
     <<H:1, G:1, F:1, E:1, D:1, C:1, B:1, A:1>>.
 
-%% @doc Used for executing prepared statements. The bit offset whould be 0 in
+%% @doc Used for executing prepared statements. The bit offset would be 0 in
 %% this case.
 -spec build_null_bitmap([any()]) -> binary().
 build_null_bitmap(Values) ->
@@ -940,12 +979,13 @@ decode_binary(#col{type = ?TYPE_TINY, flags = F},
               <<Value:8/signed, Rest/binary>>)
   when F band ?UNSIGNED_FLAG == 0 ->
     {Value, Rest};
-decode_binary(#col{type = T, decimals = S, length = L}, Data)
+decode_binary(#col{type = T, decimals = S, length = L,
+                   decode_decimal = DecodeDecimal}, Data)
   when T == ?TYPE_DECIMAL; T == ?TYPE_NEWDECIMAL ->
     %% Length is the max number of symbols incl. dot and minus sign, e.g. the
     %% number of digits plus 2.
     {Binary, Rest} = lenenc_str(Data),
-    {decode_decimal(Binary, L - 2, S), Rest};
+    {decode_decimal(DecodeDecimal, Binary, L - 2, S), Rest};
 decode_binary(#col{type = ?TYPE_DOUBLE},
               <<Value:64/float-little, Rest/binary>>) ->
     {Value, Rest};
@@ -1095,6 +1135,14 @@ encode_param(Value) when is_integer(Value), Value < 0 ->
     end;
 encode_param(Value) when is_float(Value) ->
     {<<?TYPE_DOUBLE, 0>>, <<Value:64/float-little>>};
+encode_param({decimal, Value}) ->
+    Bin = if is_binary(Value) -> Value;
+             is_list(Value) -> list_to_binary(Value);
+             is_integer(Value) -> integer_to_binary(Value);
+             is_float(Value) -> list_to_binary(io_lib:format("~w", [Value]))
+          end,
+    EncLength = lenenc_int_encode(byte_size(Bin)),
+    {<<?TYPE_DECIMAL, 0>>, <<EncLength/binary, Bin/binary>>};
 encode_param(Value) when is_bitstring(Value) ->
     Binary = encode_bitstring(Value),
     EncLength = lenenc_int_encode(byte_size(Binary)),
@@ -1164,6 +1212,9 @@ is_valid_param(Value) when is_list(Value) ->
     end;
 is_valid_param(Value) when is_number(Value) ->
     true;
+is_valid_param({decimal, Value}) when is_binary(Value); is_list(Value);
+                                      is_float(Value); is_integer(Value) ->
+    true;
 is_valid_param(Value) when is_bitstring(Value) ->
     true;
 is_valid_param({Y, M, D}) ->
@@ -1190,11 +1241,16 @@ encode_bitstring(Bitstring) ->
     PaddingSize = byte_size(Bitstring) * 8 - Size,
     <<0:PaddingSize, Bitstring:Size/bitstring>>.
 
-decode_decimal(Bin, _P, 0) ->
+decode_decimal(Decode, Bin, _P, 0) when Decode =:= number;
+                                        Decode =:= auto ->
     binary_to_integer(Bin);
-decode_decimal(Bin, P, S) when P =< 15, S > 0 ->
+decode_decimal(Decode, Bin, _P, 0) when Decode =:= float ->
+    float(binary_to_integer(Bin));
+decode_decimal(Decode, Bin, P, S) when Decode =:= auto, P =< 15, S > 0;
+                                       Decode =:= number;
+                                       Decode =:= float ->
     binary_to_float(Bin);
-decode_decimal(Bin, P, S) when P >= 16, S > 0 ->
+decode_decimal(_Decode, Bin, _P, _S) ->
     Bin.
 
 %% -- Protocol basics: packets --
@@ -1530,12 +1586,21 @@ encrypt_password(Password, Salt, PubKey, ServerVersion)
     %% Prior to server 8.0.5 the encryption was done using RSA_PKCS1_PADDING.
     %% With 8.0.5 it is done with RSA_PKCS1_OAEP_PADDING."
     RsaPadding = case ServerVersion < [8, 0, 5] of
-        true -> rsa_pkcs1_padding;
-        false -> rsa_pkcs1_oaep_padding
+        true ->
+            logger:warning("Using unsafe cipher algorithm padding rsa_pkcs1_padding"),
+            rsa_pkcs1_padding;
+        false ->
+            rsa_pkcs1_oaep_padding
     end,
+
+    %% In OTP 27.0, public_key:encrypt_public was deprecated, and
+    %% de-deprecated again in 27.1. We mitigate the possible deprecation
+    %% warning by putting the module name in a variable and use it to
+    %% perform the call.
     %% The option rsa_pad was renamed to rsa_padding in OTP/22, but rsa_pad
     %% is being kept for backwards compatibility.
-    public_key:encrypt_public(Password2, PubKey, [{rsa_pad, RsaPadding}]);
+    PublicKeyMod = public_key,
+    PublicKeyMod:encrypt_public(Password2, PubKey, [{rsa_pad, RsaPadding}]);
 encrypt_password(Password, Salt, PubKey, ServerVersion) ->
     encrypt_password(iolist_to_binary(Password), Salt, PubKey, ServerVersion).
 
@@ -1589,6 +1654,28 @@ nulterm_str(Bin) ->
 %% Testing some of the internal functions, mostly the cases we don't cover in
 %% other tests.
 
+server_info_test() ->
+    lists:foreach(
+        fun ({Input, Exp}) ->
+            ?assertEqual(Exp, get_server_info(Input)),
+            ?assertEqual(Exp, get_server_info(<<Input/binary, $a>>)),
+            ?assertEqual(Exp, get_server_info(<<Input/binary, $-, $a>>)),
+            ?assertEqual(Exp, get_server_info(<<Input/binary, $-, $0>>))
+        end,
+        [
+            {<<"4.1.0">>, {mysql, [4, 1, 0]}},
+            {<<"5.0.0">>, {mysql, [5, 0, 0]}},
+            {<<"5.1.0">>, {mysql, [5, 1, 0]}},
+            {<<"5.2.0">>, {mariadb, [5, 2, 0]}},
+            {<<"5.3.0">>, {mariadb, [5, 3, 0]}},
+            {<<"5.5.0">>, {mysql, [5, 5, 0]}},
+            {<<"5.6.0">>, {mysql, [5, 6, 0]}},
+            {<<"5.7.0">>, {mysql, [5, 7, 0]}},
+            {<<"8.0.0">>, {mysql, [8, 0, 0]}},
+            {<<"5.5.5-10.0.0">>, {mariadb, [10, 0, 0]}}
+        ]
+    ).
+
 decode_text_test() ->
     %% Int types
     lists:foreach(fun (T) ->
@@ -1607,10 +1694,51 @@ decode_text_test() ->
                   [?TYPE_FLOAT, ?TYPE_DOUBLE]),
     %% Decimal types
     lists:foreach(fun (T) ->
-                      ColDef = #col{type = T, decimals = 1, length = 4},
-                      ?assertMatch(3.0, decode_text(ColDef, <<"3.0">>))
+                      ColDef = #col{type = T},
+                      ?assertMatch(3.0,
+                                   decode_text(ColDef#col{decimals = 1, length = 4},
+                                               <<"3.0">>)),
+                      %% Decimal Decode Options
+                      %% A small value like this would be returned as a float
+                      %% if decode_decimal=auto. We want to test forcing the
+                      %% binary return
+                      ?assertMatch(<<"3.0">>,
+                                   decode_text(ColDef#col{decimals = 1, length = 4,
+                                                          decode_decimal = binary},
+                                               <<"3.0">>)),
+                      %% When decode_decimal=number, we expect a float and accept the
+                      %% precision loss.
+                      ?assertMatch(123456789.45678912,
+                                   decode_text(ColDef#col{decimals = 12, length = 23,
+                                                          decode_decimal = number},
+                                               <<"123456789.456789123456789">>)),
+                      %% When with decode_decimal=auto, we expect a binary
+                      %% when the float value is large
+                      ?assertMatch(<<"12345678901234567890.12345">>,
+                                   decode_text(ColDef#col{decimals = 5, length = 27,
+                                                          decode_decimal = auto},
+                                               <<"12345678901234567890.12345">>)),
+                      %% When with decode_decimal=number, we expect a large float
+                      ?assertMatch(1.2345678901234567e19,
+                                   decode_text(ColDef#col{decimals = 5, length = 27,
+                                                          decode_decimal = number},
+                                               <<"12345678901234567890.12345">>)),
+                      %% When decode_decimal=float, even if the expected return value
+                      %% would be an integer, force the float
+                      ?assertMatch(3.0,
+                                   decode_text(ColDef#col{decimals = 0, length = 2,
+                                                          decode_decimal = float},
+                                               <<"3">>)),
+                      %% decimal_decode=auto will encode to binary to prevent
+                      %% the loss of precision when converting to float, so
+                      %% this is just testing to ensure that that happens.
+                      ?assertMatch(<<"123456789.456789123456789">>,
+                                   decode_text(ColDef#col{decimals = 12, length = 23,
+                                                          decode_decimal = auto},
+                                               <<"123456789.456789123456789">>))
                   end,
                   [?TYPE_DECIMAL, ?TYPE_NEWDECIMAL]),
+
     ?assertEqual(3.0,  decode_text(#col{type = ?TYPE_FLOAT}, <<"3">>)),
     ?assertEqual(30.0, decode_text(#col{type = ?TYPE_FLOAT}, <<"3e1">>)),
     ?assertEqual(3,    decode_text(#col{type = ?TYPE_LONG}, <<"3">>)),
@@ -1881,4 +2009,3 @@ allowed_path_test() ->
     ).
 
 -endif.
-

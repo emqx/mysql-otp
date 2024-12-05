@@ -1,5 +1,5 @@
 %% MySQL/OTP – MySQL client library for Erlang/OTP
-%% Copyright (C) 2014-2018 Viktor Söderqvist
+%% Copyright (C) 2014-2021 Viktor Söderqvist
 %%
 %% This file is part of MySQL/OTP.
 %%
@@ -27,17 +27,12 @@
 -module(mysql_conn).
 
 -behaviour(gen_server).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
+         code_change/3, format_status/1]).
 
-%% gen_server.
--export([ init/1
-        , handle_call/3
-        , handle_cast/2
-        , handle_info/2
-        , terminate/2
-        , code_change/3
-        , format_status/1
-        , format_status/2
-        ]).
+-if(?OTP_RELEASE < 25).
+-export([format_status/2]).
+-endif.
 
 -define(default_host, "localhost").
 -define(default_port, 3306).
@@ -66,10 +61,13 @@
                 connect_timeout, ping_timeout, query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
-                stmts = dict:new(), query_cache = empty, cap_found_rows = false}).
+                stmts = #{}, query_cache = mysql_cache:new(), cap_found_rows = false,
+                float_as_decimal = false, decode_decimal = auto}).
 
 %% @private
 init(Opts) ->
+    ok = logger:set_process_metadata(#{domain => [mysql]}),
+
     %% Connect
     Host           = proplists:get_value(host, Opts, ?default_host),
 
@@ -98,6 +96,8 @@ init(Opts) ->
 
     Queries           = proplists:get_value(queries, Opts, []),
     Prepares          = proplists:get_value(prepare, Opts, []),
+    FloatAsDecimal    = proplists:get_value(float_as_decimal, Opts, false),
+    DecodeDecimal     = proplists:get_value(decode_decimal, Opts, auto),
 
     true = lists:all(fun mysql_protocol:valid_path/1, AllowedLocalPaths),
 
@@ -120,7 +120,9 @@ init(Opts) ->
         ping_timeout = PingTimeout,
         query_timeout = QueryTimeout,
         query_cache_time = QueryCacheTime,
-        cap_found_rows = (SetFoundRows =:= true)
+        cap_found_rows = (SetFoundRows =:= true),
+        float_as_decimal = FloatAsDecimal,
+        decode_decimal = DecodeDecimal
     },
 
     case proplists:get_value(connect_mode, Opts, synchronous) of
@@ -175,7 +177,7 @@ connect(#state{connect_timeout = ConnectTimeout} = State) ->
 
 connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
     %% Connect socket
-    SockOpts = sanitize_tcp_opts(TcpOpts),
+    SockOpts = sanitize_tcp_opts(Host, TcpOpts),
     case gen_tcp:connect(Host, Port, SockOpts) of
         {ok, Socket} ->
             %% If buffer wasn't specifically defined make it at least as
@@ -193,12 +195,13 @@ connect_socket(#state{tcp_opts = TcpOpts, host = Host, port = Port} = State) ->
             Error
     end.
 
-sanitize_tcp_opts([{inet_backend, _} = InetBackend | TcpOpts0]) ->
+sanitize_tcp_opts(Host, [{inet_backend, _} = InetBackend | TcpOpts0]) ->
     %% This option is be used to turn on the experimental socket backend for
     %% gen_tcp/inet (OTP/23). If given, it must remain the first option in the
     %% list.
-    [InetBackend | sanitize_tcp_opts(TcpOpts0)];
-sanitize_tcp_opts(TcpOpts0) ->
+    [InetBackend | sanitize_tcp_opts(Host, TcpOpts0)];
+sanitize_tcp_opts(Host, TcpOpts0) ->
+    NodelaySupported = not is_tuple(Host) orelse element(1, Host) =/= local,
     TcpOpts1 = lists:filter(
         fun
             ({mode, _}) -> false;
@@ -206,13 +209,14 @@ sanitize_tcp_opts(TcpOpts0) ->
             (list) -> false;
             ({packet, _}) -> false;
             ({active, _}) -> false;
+            ({nodelay, _}) -> NodelaySupported;
             (_) -> true
         end,
         TcpOpts0
     ),
-    TcpOpts2 = case lists:keymember(nodelay, 1, TcpOpts1) of
-        true -> TcpOpts1;
-        false -> [{nodelay, true} | TcpOpts1]
+    TcpOpts2 = case NodelaySupported andalso not lists:keymember(nodelay, 1, TcpOpts1) of
+        true -> [{nodelay, true} | TcpOpts1];
+        false -> TcpOpts1
     end,
     [binary, {packet, raw}, {active, false} | TcpOpts2].
 
@@ -320,6 +324,11 @@ handle_call(Msg, From, #state{socket = undefined} = State) ->
         {error, _} = E ->
             shutdown(E, State)
     end;
+handle_call({query, _Query, _FilterMap, _Timeout}, {FromPid, _},
+            State = #state{transaction_levels = [{OtherFromPid, _} | _]})
+  when FromPid =/= OtherFromPid ->
+    %% this conn is currently in transaction owned by another process
+    {reply, {error, busy}, State};
 handle_call({query, Query, FilterMap, Timeout}, _From, State) ->
     {Reply, State1} = query(Query, FilterMap, Timeout, State),
     {reply, Reply, State1};
@@ -327,6 +336,11 @@ handle_call({param_query, Query, Params, FilterMap, default_timeout}, From,
             State) ->
     handle_call({param_query, Query, Params, FilterMap,
                 State#state.query_timeout}, From, State);
+handle_call({param_query, _Query, _Params, _FilterMap, _Timeout}, {FromPid, _},
+            State = #state{transaction_levels = [{OtherFromPid, _} | _]})
+  when FromPid =/= OtherFromPid ->
+    %% this conn is currently in transaction owned by another process
+    {reply, {error, busy}, State};
 handle_call({param_query, Query, Params, FilterMap, Timeout}, _From,
             #state{socket = Socket, sockmod = SockMod} = State) ->
     %% Parametrized query: Prepared statement cached with the query as the key
@@ -346,7 +360,7 @@ handle_call({param_query, Query, Params, FilterMap, Timeout}, _From,
                     {{error, error_to_reason(E)}, Cache};
                 #prepared{} = Stmt ->
                     %% If the first entry in the cache, start the timer.
-                    Cache == empty andalso begin
+                    mysql_cache:is_empty(Cache) andalso begin
                         When = State#state.query_cache_time * 2,
                         erlang:send_after(When, self(), query_cache)
                     end,
@@ -364,12 +378,17 @@ handle_call({param_query, Query, Params, FilterMap, Timeout}, _From,
 handle_call({execute, Stmt, Args, FilterMap, default_timeout}, From, State) ->
     handle_call({execute, Stmt, Args, FilterMap, State#state.query_timeout},
         From, State);
+handle_call({execute, _Stmt, _Args, _FilterMap, _Timeout}, {FromPid, _},
+            State = #state{transaction_levels = [{OtherFromPid, _} | _]})
+  when FromPid =/= OtherFromPid ->
+    %% this conn is currently in transaction owned by another process
+    {reply, {error, busy}, State};
 handle_call({execute, Stmt, Args, FilterMap, Timeout}, _From, State) ->
-    case dict:find(Stmt, State#state.stmts) of
-        {ok, StmtRec} ->
+    case State#state.stmts of
+        #{Stmt := StmtRec} ->
             {Reply, State1} = execute_stmt(StmtRec, Args, FilterMap, Timeout, State),
             {reply, Reply, State1};
-        error ->
+        #{} ->
             {reply, {error, not_prepared}, State}
     end;
 handle_call({prepare, Query}, _From, State) ->
@@ -377,26 +396,25 @@ handle_call({prepare, Query}, _From, State) ->
     setopts(SockMod, Socket, [{active, false}]),
     Rec = mysql_protocol:prepare(Query, SockMod, Socket),
     setopts(SockMod, Socket, [{active, once}]),
-    State1 = update_state(Rec, State),
+    State1 = #state{stmts = Stmts1} = update_state(Rec, State),
     case Rec of
         #error{} = E ->
             {reply, {error, error_to_reason(E)}, State1};
         #prepared{statement_id = Id} = Stmt ->
-            Stmts1 = dict:store(Id, Stmt, State1#state.stmts),
-            State2 = State#state{stmts = Stmts1},
+            State2 = State#state{stmts = Stmts1#{Id => Stmt}},
             {reply, {ok, Id}, State2}
     end;
 handle_call({prepare, Name, Query}, _From, State) ->
     {Reply, State1} = named_prepare(Name, Query, State),
     {reply, Reply, State1};
 handle_call({unprepare, Stmt}, _From, State) ->
-    case dict:find(Stmt, State#state.stmts) of
-        {ok, StmtRec} ->
+    case maps:take(Stmt, State#state.stmts) of
+        {StmtRec, Stmts1} ->
             #state{socket = Socket, sockmod = SockMod} = State,
             setopts(SockMod, Socket, [{active, false}]),
             mysql_protocol:unprepare(StmtRec, SockMod, Socket),
             setopts(SockMod, Socket, [{active, once}]),
-            State1 = State#state{stmts = dict:erase(Stmt, State#state.stmts)},
+            State1 = State#state{stmts = Stmts1},
             State2 = schedule_ping(State1),
             {reply, ok, State2};
         error ->
@@ -419,7 +437,7 @@ handle_call({change_user, Username, Password, Options}, From,
     State1 = update_state(Result, State),
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, "CHANGE USER"),
-    State2 = State1#state{query_cache = empty, stmts = dict:new()},
+    State2 = State1#state{query_cache = mysql_cache:new(), stmts = #{}},
     case Result of
         #ok{} ->
             State3 = State2#state{user = Username, password = Password,
@@ -445,7 +463,7 @@ handle_call(reset_connection, _From, #state{socket = Socket, sockmod = SockMod} 
         #ok{} -> ok;
         #error{} = E ->
             %% 'COM_RESET_CONNECTION' is added in MySQL 5.7 and MariaDB 10
-            %% "Unkown command" is returned when MySQL =< 5.6 or MariaDB =< 5.5
+            %% "Unknown command" is returned when MySQL =< 5.6 or MariaDB =< 5.5
             {error, error_to_reason(E)}
     end,
     {reply, Reply, State1};
@@ -463,7 +481,14 @@ handle_call(backslash_escapes_enabled, _From, State = #state{status = S}) ->
 handle_call(in_transaction, _From, State) ->
     {reply, State#state.status band ?SERVER_STATUS_IN_TRANS /= 0, State};
 handle_call(start_transaction, {FromPid, _},
+            State = #state{transaction_levels = [{OtherFromPid, _}|_]})
+  when FromPid =/= OtherFromPid ->
+    %% the idea of "nested transaction" is that mysql:transaction can be called
+    %% in the transaction function, but all within the same process
+    {reply, {error, busy}, State};
+handle_call(start_transaction, {FromPid, _},
             State = #state{socket = Socket, sockmod = SockMod,
+                           decode_decimal = DecodeDecimal,
                            transaction_levels = L, status = Status})
   when Status band ?SERVER_STATUS_IN_TRANS == 0, L == [];
        Status band ?SERVER_STATUS_IN_TRANS /= 0, L /= [] ->
@@ -474,39 +499,41 @@ handle_call(start_transaction, {FromPid, _},
     end,
     setopts(SockMod, Socket, [{active, false}]),
     {ok, [Res = #ok{}]} = mysql_protocol:query(Query, SockMod, Socket,
-                                               [], no_filtermap_fun,
+                                               [], DecodeDecimal, no_filtermap_fun,
                                                ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Res, State),
     {reply, ok, State1#state{transaction_levels = [{FromPid, MRef} | L]}};
 handle_call(rollback, {FromPid, _},
             State = #state{socket = Socket, sockmod = SockMod, status = Status,
+                           decode_decimal = DecodeDecimal,
                            transaction_levels = [{FromPid, MRef} | L]})
   when Status band ?SERVER_STATUS_IN_TRANS /= 0 ->
-    erlang:demonitor(MRef),
+    erlang:demonitor(MRef, [flush]),
     Query = case L of
         [] -> <<"ROLLBACK">>;
         _  -> <<"ROLLBACK TO s", (integer_to_binary(length(L)))/binary>>
     end,
     setopts(SockMod, Socket, [{active, false}]),
     {ok, [Res = #ok{}]} = mysql_protocol:query(Query, SockMod, Socket,
-                                               [], no_filtermap_fun,
+                                               [], DecodeDecimal, no_filtermap_fun,
                                                ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Res, State),
     {reply, ok, State1#state{transaction_levels = L}};
 handle_call(commit, {FromPid, _},
             State = #state{socket = Socket, sockmod = SockMod, status = Status,
+                           decode_decimal = DecodeDecimal,
                            transaction_levels = [{FromPid, MRef} | L]})
   when Status band ?SERVER_STATUS_IN_TRANS /= 0 ->
-    erlang:demonitor(MRef),
+    erlang:demonitor(MRef, [flush]),
     Query = case L of
         [] -> <<"COMMIT">>;
         _  -> <<"RELEASE SAVEPOINT s", (integer_to_binary(length(L)))/binary>>
     end,
     setopts(SockMod, Socket, [{active, false}]),
     {ok, [Res = #ok{}]} = mysql_protocol:query(Query, SockMod, Socket,
-                                               [], no_filtermap_fun,
+                                               [], DecodeDecimal, no_filtermap_fun,
                                                ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Res, State),
@@ -547,7 +574,7 @@ handle_info(query_cache, #state{query_cache = Cache,
                   Evicted),
     setopts(SockMod, Socket, [{active, once}]),
     %% If nonempty, schedule eviction again.
-    mysql_cache:size(Cache1) > 0 andalso
+    mysql_cache:is_empty(Cache1) orelse
         erlang:send_after(CacheTime, self(), query_cache),
     {noreply, State#state{query_cache = Cache1}};
 handle_info({'DOWN', _MRef, _, Pid, _Info}, State) ->
@@ -561,21 +588,11 @@ handle_info({SockClosed, _Socket}, State) when SockClosed =:= tcp_closed; SockCl
     shutdown(normal, State#state{socket = undefined, connection_id = undefined});
 handle_info({SockError, _Socket, Reason}, State) when SockError =:= tcp_error; SockError =:= ssl_error ->
     stop_server({SockError, Reason}, State);
-handle_info({SockType, _Socket, ErrorPacket}, #state{socket = Socket, sockmod = SockMod} = State)
+handle_info({SockType, _Socket, _Data}, #state{socket = Socket,
+                                                     sockmod = SockMod} = State)
         when SockType =:= tcp; SockType =:= ssl ->
-    %% Sometimes the mysql sends us an error response even if we have never sent any requests.
-    %% Following is an example of the error response:
-    %% - Error Code: 4031
-    %% - SQL state: HY000
-    %% - Error message: The client was disconnected by the server because of inactivity.
-    %%                  See wait_timeout and interactive_timeout for configuring this behavior.
-    case mysql_protocol:maybe_parse_error_packet(ErrorPacket) of
-        {ok, #error{code = ErrCode, state = SQLState, msg = ErrMsg}} ->
-            error_logger:error_msg("Received error from MySQL. Code: ~p, SQLState: ~p, Message: ~p",
-                                   [ErrCode, SQLState, ErrMsg]);
-        {error, _} ->
-            ok
-    end,
+    %% Ignore out-of-band messages sent by the server,
+    %% eg. before closing the connection because of a session timeout
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, State};
 handle_info(_Info, State) ->
@@ -596,30 +613,31 @@ code_change(_OldVsn, State = #state{}, _Extra) ->
 code_change(_OldVsn, _State, _Extra) ->
     {error, incompatible_state}.
 
-format_status(#{state := State} = Status) ->
-    Status#{state := State#state{password = <<"******">>}}.
-
-format_status(_Opt, [_PDict, State]) ->
-    [{data, [{"State", State#state{password = <<"******">>}}]}].
-
 %% --- Helpers ---
 
 %% @doc Executes a prepared statement and returns {Reply, NewState}.
 execute_stmt(Stmt, Args, FilterMap, Timeout, State) ->
     #state{socket = Socket, sockmod = SockMod,
-           allowed_local_paths = AllowedPaths} = State,
+           allowed_local_paths = AllowedPaths,
+           float_as_decimal = FloatAsDecimal,
+           decode_decimal = DecodeDecimal} = State,
+    Args1 = case FloatAsDecimal of
+                false ->
+                    Args;
+                _ ->
+                    [float_to_decimal(Arg, FloatAsDecimal) || Arg <- Args]
+            end,
     setopts(SockMod, Socket, [{active, false}]),
-    {ok, Recs} = case mysql_protocol:execute(Stmt, Args, SockMod, Socket,
-                                             AllowedPaths, FilterMap,
-                                             Timeout) of
+    {ok, Recs} = case mysql_protocol:execute(Stmt, Args1, SockMod, Socket,
+                                             AllowedPaths, DecodeDecimal,
+                                             FilterMap, Timeout) of
         {error, timeout} when State#state.server_version >= [5, 0, 0] ->
             kill_query(State),
-            mysql_protocol:fetch_execute_response(SockMod, Socket,
-                                                  [], FilterMap, ?cmd_timeout);
-        {error, timeout} ->
-            %% For MySQL 4.x.x there is no way to recover from timeout except
-            %% killing the connection itself.
-            exit(timeout);
+            mysql_protocol:fetch_execute_response(SockMod, Socket, [],
+                                                  DecodeDecimal, FilterMap,
+                                                  ?cmd_timeout);
+        {error, Reason} ->
+            exit(Reason);
         QueryResult ->
             QueryResult
     end,
@@ -628,6 +646,14 @@ execute_stmt(Stmt, Args, FilterMap, Timeout, State) ->
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, Stmt#prepared.orig_query),
     handle_query_call_result(Recs, Stmt#prepared.orig_query, State1).
+
+%% @doc Formats floats as decimals, optionally with a given number of decimals.
+float_to_decimal(Arg, true) when is_float(Arg) ->
+    {decimal, list_to_binary(io_lib:format("~w", [Arg]))};
+float_to_decimal(Arg, N) when is_float(Arg), is_integer(N) ->
+    {decimal, float_to_binary(Arg, [{decimals, N}, compact])};
+float_to_decimal(Arg, _) ->
+    Arg.
 
 %% @doc Produces a tuple to return as an error reason.
 -spec error_to_reason(#error{}) -> mysql:server_reason().
@@ -659,20 +685,19 @@ query(Query, FilterMap, default_timeout,
     query(Query, FilterMap, DefaultTimeout, State);
 query(Query, FilterMap, Timeout, State) ->
     #state{sockmod = SockMod, socket = Socket,
-           allowed_local_paths = AllowedPaths} = State,
+           allowed_local_paths = AllowedPaths,
+           decode_decimal = DecodeDecimal} = State,
     setopts(SockMod, Socket, [{active, false}]),
     Result = mysql_protocol:query(Query, SockMod, Socket, AllowedPaths,
-                                  FilterMap, Timeout),
+                                  DecodeDecimal, FilterMap, Timeout),
     {ok, Recs} = case Result of
         {error, timeout} when State#state.server_version >= [5, 0, 0] ->
             kill_query(State),
             mysql_protocol:fetch_query_response(SockMod, Socket,
-                                                [], FilterMap,
+                                                [], DecodeDecimal, FilterMap,
                                                 ?cmd_timeout);
-        {error, timeout} ->
-            %% For MySQL 4.x.x there is no way to recover from timeout except
-            %% killing the connection itself.
-            exit(timeout);
+        {error, Reason} ->
+            exit(Reason);
         QueryResult ->
             QueryResult
     end,
@@ -688,22 +713,21 @@ named_prepare(Name, Query, State) ->
     #state{socket = Socket, sockmod = SockMod} = State,
     %% First unprepare if there is an old statement with this name.
     setopts(SockMod, Socket, [{active, false}]),
-    State1 = case dict:find(Name, State#state.stmts) of
-        {ok, OldStmt} ->
+    State1 = case maps:take(Name, State#state.stmts) of
+        {OldStmt, Stmts1} ->
             mysql_protocol:unprepare(OldStmt, SockMod, Socket),
-            State#state{stmts = dict:erase(Name, State#state.stmts)};
+            State#state{stmts = Stmts1};
         error ->
             State
     end,
     Rec = mysql_protocol:prepare(Query, SockMod, Socket),
     setopts(SockMod, Socket, [{active, once}]),
-    State2 = update_state(Rec, State1),
+    State2 = #state{stmts = Stmts2} = update_state(Rec, State1),
     case Rec of
         #error{} = E ->
             {{error, error_to_reason(E)}, State2};
         #prepared{} = Stmt ->
-            Stmts1 = dict:store(Name, Stmt, State2#state.stmts),
-            State3 = State2#state{stmts = Stmts1},
+            State3 = State2#state{stmts = Stmts2#{Name => Stmt}},
             {{ok, Name}, State3}
     end.
 
@@ -764,16 +788,18 @@ schedule_ping(State = #state{ping_timeout = Timeout, ping_ref = Ref}) ->
     State#state{ping_ref = erlang:send_after(Timeout, self(), ping)}.
 
 %% @doc Fetches and logs warnings. Query is the query that gave the warnings.
-log_warnings(#state{socket = Socket, sockmod = SockMod}, Query) ->
+log_warnings(#state{socket = Socket, sockmod = SockMod,
+                    decode_decimal = DecodeDecimal}, Query) ->
     setopts(SockMod, Socket, [{active, false}]),
     {ok, [#resultset{rows = Rows}]} = mysql_protocol:query(<<"SHOW WARNINGS">>,
                                                            SockMod, Socket,
-                                                           [], no_filtermap_fun,
+                                                           [], DecodeDecimal,
+                                                           no_filtermap_fun,
                                                            ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     Lines = [[Level, " ", integer_to_binary(Code), ": ", Message, "\n"]
              || [Level, Code, Message] <- Rows],
-    error_logger:warning_msg("~s in ~s~n", [Lines, Query]).
+    logger:warning("~s in ~s~n", [Lines, Query]).
 
 %% @doc Logs slow queries. Query is the query that gave the warnings.
 maybe_log_slow_query(#state{log_slow_queries = true}, S, RecNum, Query)
@@ -792,8 +818,8 @@ maybe_log_slow_query(#state{log_slow_queries = true}, S, RecNum, Query)
         _ ->
             io_lib:format(" #~b", [RecNum])
     end,
-    error_logger:warning_msg("MySQL query~s~s was slow: ~s~n",
-                             [QueryNumHint, IndexHint, Query]);
+    logger:warning("MySQL query~s~s was slow: ~s~n",
+                   [QueryNumHint, IndexHint, Query]);
 maybe_log_slow_query(_, _, _, _) ->
     ok.
 
@@ -815,23 +841,25 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
             IdBin = integer_to_binary(ConnId),
             {ok, [#ok{}]} = mysql_protocol:query(<<"KILL QUERY ", IdBin/binary>>,
                                                  SockMod, Socket,
-                                                 [], no_filtermap_fun,
+                                                 [], auto,
+                                                 no_filtermap_fun,
                                                  ?cmd_timeout),
             mysql_protocol:quit(SockMod, Socket);
         #error{} = E ->
-            error_logger:error_msg("Failed to connect to kill query: ~p",
-                                   [error_to_reason(E)]);
+            logger:error("Failed to connect to kill query: ~p",
+                         [error_to_reason(E)]);
         {error, Reason} ->
-            error_logger:error_msg("Failed to connect to kill query: ~p", [Reason])
+            logger:error("Failed to connect to kill query: ~p", [Reason])
     end.
 
 stop_server(Reason, #state{socket = undefined} = State) ->
     shutdown(Reason, State);
 stop_server(Reason,
-            #state{socket = Socket, sockmod = SockMod, connection_id = ConnId} = State) ->
-    error_logger:error_msg("Connection Id ~p closing with reason: ~p~n", [ConnId, Reason]),
-    ok = SockMod:close(Socket),
-    shutdown(Reason, State#state{socket = undefined, connection_id = undefined}).
+            #state{socket = Socket, connection_id = ConnId, sockmod = SockMod} = State) ->
+  logger:error("Connection Id ~p closing with reason: ~p~n",
+               [ConnId, Reason]),
+  ok = SockMod:close(Socket),
+  shutdown(Reason, State#state{socket = undefined, connection_id = undefined}).
 
 setopts(gen_tcp, Socket, Opts) ->
     inet:setopts(Socket, Opts);
@@ -841,7 +869,7 @@ setopts(SockMod, Socket, Opts) ->
 demonitor_processes(List, 0) ->
     List;
 demonitor_processes([{_FromPid, MRef}|T], Count) ->
-    erlang:demonitor(MRef),
+    erlang:demonitor(MRef, [flush]),
     demonitor_processes(T, Count - 1).
 
 shutdown(Reason) ->
@@ -854,3 +882,26 @@ wrap_shutdown(normal) -> normal;
 wrap_shutdown(shutdown) -> shutdown;
 wrap_shutdown({shutdown, _} = Reason) -> Reason;
 wrap_shutdown(Reason) -> {shutdown, Reason}.
+
+format_status(Status = #{state := State = #state{ssl_opts = SSLOpts}}) ->
+    Status#{state := State#state{password = hidden,
+				 ssl_opts = obfuscate_ssl_options(SSLOpts)}}.
+
+-if(?OTP_RELEASE < 25).
+format_status(_, [_PDict, State = #state{ssl_opts = SSLOpts}]) ->
+    {data, [{"State", State#state{password = hidden,
+				  ssl_opts = obfuscate_ssl_options(SSLOpts)}}]}.
+-endif.
+
+obfuscate_ssl_options(undefined) ->
+    undefined;
+obfuscate_ssl_options(SSLOpts) ->
+    lists:map(
+        fun
+            ({cert, _}) -> {cert, hidden};
+            ({key, _}) -> {key, hidden};
+            ({cacerts, _}) -> {cacerts, hidden};
+            (Other) -> Other
+        end,
+        SSLOpts
+    ).

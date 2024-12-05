@@ -1,5 +1,5 @@
 ---
-name: build
+name: CI
 on:
   push:
     branches:
@@ -9,24 +9,33 @@ on:
       - master
 jobs:
   ci:
-    name: CI
+    name: OTP ${{matrix.otp[0]}} + ${{matrix.image[0]}} ${{matrix.image[1]}}
     runs-on: ${{matrix.os}}
     strategy:
+      fail-fast: false
       matrix:
-        otp: [25, 26]
+        otp:
+          - [24, "3.21.0"]
+          - [25, "3.24.0"]
+          - [26, "3.24.0"]
+          - [27, "3.24.0"]
+        image:
+          - ["mysql", "5.7"]
+          - ["mysql", "8.4"]
+          - ["mysql", "9.0"]
+          - ["mariadb", "10"]
+          - ["mariadb", "11"]
         os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: ${{matrix.otp}}
-          rebar3-version: 3.20.0
-      - run: |
-          docker compose -f .ci/docker-compose.yml up -d --wait
-          sleep 10
+          otp-version: ${{matrix.otp[0]}}
+          rebar3-version: ${{matrix.otp[1]}}
+      - name: Run tests
+        run: |
           set -x
-          docker exec mysql mysql -h 127.0.0.1 -uroot -e "CREATE USER otptest@'%' IDENTIFIED BY 'otptest';"
-          docker exec mysql mysql -h 127.0.0.1 -uroot -e "GRANT ALL PRIVILEGES ON otptest.* TO otptest@'%';"
-          docker exec mysql mysql -h 127.0.0.1 -uroot -e "CREATE USER otptest2@'%' IDENTIFIED BY 'otptest2';"
-          docker exec mysql mysql -h 127.0.0.1 -uroot -e "GRANT ALL PRIVILEGES ON otptest.* TO otptest2@'%';"
-      - run: make tests
+          export MYSQL_IMAGE=${{ matrix.image[0] }}
+          export MYSQL_VERSION=${{ matrix.image[1] }}
+          make tests-prep
+          make tests

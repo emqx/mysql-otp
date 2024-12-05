@@ -22,7 +22,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(user,     "otptest").
--define(password, "otptest").
+-define(password, "OtpTest--123").
 
 single_connection_test_() ->
     {setup,
@@ -91,7 +91,7 @@ application_process_kill() ->
     receive killme -> ok end,
 
     %% Kill AppPid, the process using the connection, capturing the noise
-    {ok, ok, LoggedErrors} = error_logger_acc:capture(fun () ->
+    {ok, ok, LoggedErrors} = logger_acc:capture(fun () ->
         exit(AppPid, kill),
         receive
             {'DOWN', Mref, process, Pid, {shutdown, {application_process_died, AppPid}}} ->
@@ -101,12 +101,12 @@ application_process_kill() ->
         end
     end),
     %% Check that we got the expected error log noise
-    ?assertMatch([{error, "Connection Id" ++ _} %% from mysql_conn
+    ?assertMatch([{error, [mysql], "Connection Id" ++ _} %% from mysql_conn
                  ], LoggedErrors),
 
     ?assertNot(is_process_alive(Pid)),
 
-    %% Check that the transaction was not commited
+    %% Check that the transaction was not committed
     {ok, Pid2} = mysql:start_link([
         {user, ?user},
         {password, ?password},
@@ -383,13 +383,13 @@ lock_wait_timeout({_Conn1, Conn2} = Conns) ->
             lock_wait_timeout1(Conns);
         {error, {1238, _, <<"Variable 'innodb_lock_wait_timeout' is a read on",
                             _/binary>>}} ->
-            error_logger:info_msg("Can't set lock wait timeout in this server"
-                                  " version. Skipping the lock wait timeout"
-                                  " test.\n")
+            logger:notice("Can't set lock wait timeout in this server"
+                          " version. Skipping the lock wait timeout"
+                          " test.\n")
     end.
 
 %% Continuation of lock_wait_timeout/1.
-lock_wait_timeout1({Conn1, Conn2}) ->    
+lock_wait_timeout1({Conn1, Conn2}) ->
     {ok, _, [[1]]} = mysql:query(Conn2, "SELECT COUNT(*) FROM foo WHERE k = 1"),
     MainPid = self(),
 

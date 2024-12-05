@@ -9,7 +9,8 @@
 #  - gh-pages:       Generates docs and eunit reports and commits these in the
 #                    gh-pages which Github publishes automatically when pushed.
 #  - CHANGELOG.md:   Generates a changelog from the git commits and tags.
-.PHONY: gh-pages tests-report tests-prep CHANGELOG.md
+#  - publish-hex:    Publishes package and docs to Hex. Requires Mix.
+.PHONY: gh-pages tests-report tests-prep CHANGELOG.md publish-hex
 
 PROJECT = mysql
 EDOC_OPTS = {stylesheet_file,"priv/edoc-style.css"},{todo,true}
@@ -22,14 +23,16 @@ ERLANG_MK_BUILD_CONFIG = erlang-mk.build.config
 include erlang.mk
 
 # Generate keys for SSL tests. Requires configuring and restarting MySQL.
+# Start MySQL or MariaDB in docker
 tests-prep:
-	$(MAKE) -C test/ssl
+	./scripts/prep.sh
 
 distclean::
 	$(MAKE) -C test/ssl clean
+	docker rm -f mysql
 
 CHANGELOG.md:
-	./changelog.sh > $@
+	priv/bin/changelog.sh > $@
 
 # Update the local 'gh-pages' branch with pregenerated output files
 # (trick from https://groups.google.com/forum/#!topic/github/XYxkdzxpgCo)
@@ -63,3 +66,10 @@ tests-report:
 	 echo '</pre>' ; \
 	 echo '</body></html>') > doc/eunit.html
 	@cp cover/*.COVER.html doc/
+
+# For publishing to Hex using Mix
+publish-hex: docs mix.exs
+	mix hex.publish
+
+mix.exs: priv/bin/mk_mix_file.escript
+	priv/bin/mk_mix_file.escript > $@
