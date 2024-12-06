@@ -1,6 +1,7 @@
 MySQL/OTP [![Build status](https://github.com/emqx/mysql-otp/actions/workflows/main.yml/badge.svg)](https://github.com/mysql-otp/jsone/actions/workflows/main.yml)
 =========
 
+ :link: [Test coverage (EUnit)](//mysql-otp.github.io/mysql-otp/eunit.html)
  :link: [API documentation (EDoc)](//mysql-otp.github.io/mysql-otp/index.html)
  :link: [Hex package](//hex.pm/packages/mysql)
 
@@ -27,7 +28,7 @@ Some of the features:
 
 Requirements:
 
-* Erlang/OTP version R16B or later
+* Erlang/OTP version 21 or later
 * MySQL database version 4.1 or later or MariaDB
 * GNU Make *or* Rebar or any other tool for building Erlang/OTP applications
 
@@ -84,18 +85,22 @@ Usage as a dependency
 Using *erlang.mk*:
 
     DEPS = mysql
-    dep_mysql = git https://github.com/mysql-otp/mysql-otp 1.7.0
+    dep_mysql = git https://github.com/mysql-otp/mysql-otp 1.8.0
 
 Using *rebar* (version 2 or 3):
 
-    {deps, [
-        {mysql, ".*", {git, "https://github.com/mysql-otp/mysql-otp",
-                       {tag, "1.7.0"}}}
-    ]}.
+```erlang
+{deps, [
+  {mysql, ".*", {git, "https://github.com/mysql-otp/mysql-otp",
+                {tag, "1.8.0"}}}
+]}.
+```
 
 Using *mix*:
 
-    {:mysql, git: "https://github.com/mysql-otp/mysql-otp", tag: "1.7.0"},
+```elixir
+{:mysql, git: "https://github.com/mysql-otp/mysql-otp", tag: "1.8.0"},
+```
 
 There's also a Hex package called [mysql](//hex.pm/packages/mysql).
 
@@ -111,33 +116,25 @@ To run individual test suites, use `make eunit t=SUITE` where SUITE is one of
 The encode and protocol test suites does not require a
 running MySQL server on localhost.
 
-For the suites `mysql_tests`, `ssl_tests` and `transaction_tests` you need to
-start MySQL on localhost and give privileges to the users `otptest`, `otptest2`
-and (for `ssl_tests`) to the user `otptestssl`:
+To quickly setup MySQL or MariaDB runing in docker for testing,
+execute `make tests-prep`, then execute `make tests`.
 
-```SQL
-CREATE USER otptest@localhost IDENTIFIED BY 'otptest';
-GRANT ALL PRIVILEGES ON otptest.* TO otptest@localhost;
+Set environemt variable `MYSQL_IMAGE=mysql|mariadb` and `MYSQL_VERSION` to pick a flavor.
 
-CREATE USER otptest2@localhost IDENTIFIED BY 'otptest2';
-GRANT ALL PRIVILEGES ON otptest.* TO otptest2@localhost;
+To test aginast MySQL or MariaDB running in localhost, follow the below steps:
 
--- in MySQL < 5.7, REQUIRE SSL must be given in GRANT
-CREATE USER otptestssl@localhost IDENTIFIED BY 'otptestssl';
-GRANT ALL PRIVILEGES ON otptest.* TO otptestssl@localhost REQUIRE SSL;
-
--- in MySQL >= 8.0, REQUIRE SSL must be given in CREATE USER
-CREATE USER otptestssl@localhost IDENTIFIED BY 'otptestssl' REQUIRE SSL;
-GRANT ALL PRIVILEGES ON otptest.* TO otptestssl@localhost;
-```
-
-Before running the test suite `ssl_tests` you'll also need to generate SSL files
-and MySQL extra config file. In order to do so, please execute `make tests-prep`.
-
-The MySQL server configuration must include `my-ssl.cnf` file,
-which can be found in `test/ssl/`.
-**Do not run** `make tests-prep` after you start MySQL,
-because CA certificates will no longer match.
+- Stop MySQL service
+- Generate SSL certificates by running `make -C test/ssl`
+- Copy `test/ssl/server-{cert,key}.pem` to `/etc/mysql/`
+- Copy `test/ssl/ca.pem` to `/etc/mysql/`
+- Change certificate file modes: `sudo chmod -R 660 /etc/mysql/*.pem`
+- Change certificate file owner: `sudo chown mysql:mysql /etc/mysql/*.pem`
+- Append SSL configs: `cat test/ssl/my-ssl.cnf | sudo tee -a /etc/mysql/conf.d/my-ssl.cnf`
+- Start MySQL service
+- Run `sudo ./scripts/init.sh` to prepare for test users.
+  The script connects to the database on localhost as root and creates users.
+  Alternatively, look into the script and perform the steps manually.
+- Run `make tests`.
 
 If you run `make tests COVER=1` a coverage report will be generated. Open
 `cover/index.html` to see that any lines you have added or modified are covered
@@ -170,12 +167,9 @@ Tagging a new version:
   * Update the online documentation and coverage reports using `make gh-pages`.
     Then push the gh-pages branch using `git push origin gh-pages`.
 
-Updating the Hex package using rebar3:
+Updating the Hex package (requires Mix):
 
-1. Setup the rebar3 hex plugin and authentication;
-    see [rebar3_hex](https://github.com/tsloughter/rebar3_hex).
-2. `rebar3 hex publish`
-3. `rebar3 hex docs`
+    make publish-hex
 
 License
 -------
@@ -184,7 +178,3 @@ GNU Lesser General Public License (LGPL) version 3 or any later version.
 Since the LGPL is a set of additional permissions on top of the GPL, both
 license texts are included in the files [COPYING](COPYING) and
 [COPYING.LESSER](COPYING.LESSER) respectively.
-
-We hope this license should be permissive enough while remaining copyleft. If
-you're having issues with this license, please create an issue in the issue
-tracker!

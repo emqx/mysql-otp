@@ -19,7 +19,8 @@
 %% --- Records ---
 
 %% Returned by parse_handshake/1.
--record(handshake, {server_version :: [integer()],
+-record(handshake, {server_vendor :: mysql | mariadb,
+                    server_version :: [integer()],
                     connection_id :: integer(),
                     capabilities :: integer(),
                     character_set :: integer(),
@@ -46,7 +47,8 @@
 -record(eof, {status, warning_count}).
 
 %% Column definition, used while parsing a result set.
--record(col, {name, type, charset, length, decimals, flags}).
+-record(col, {name, type, charset, length, decimals, flags,
+              decode_decimal=auto}).
 
 %% A resultset. The rows can be either lists of terms or unparsed binaries as
 %% received from the server using either the text protocol or the binary
@@ -56,7 +58,7 @@
                     status :: integer(),
                     warning_count :: integer()}).
 
-%% Response of a successfull prepare call.
+%% Response of a successful prepare call.
 -record(prepared, {statement_id :: integer(),
                    orig_query :: iodata(),
                    param_count :: integer(),
