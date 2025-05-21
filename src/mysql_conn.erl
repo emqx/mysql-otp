@@ -62,7 +62,8 @@
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
                 stmts = #{}, query_cache = mysql_cache:new(), cap_found_rows = false,
-                float_as_decimal = false, decode_decimal = auto}).
+                float_as_decimal = false, decode_decimal = auto,
+                basic_capabilities = #{}}).
 
 %% @private
 init(Opts) ->
@@ -99,6 +100,8 @@ init(Opts) ->
     FloatAsDecimal    = proplists:get_value(float_as_decimal, Opts, false),
     DecodeDecimal     = proplists:get_value(decode_decimal, Opts, auto),
 
+    BasicCapabilities = proplists:get_value(basic_capabilities, Opts, #{}),
+
     true = lists:all(fun mysql_protocol:valid_path/1, AllowedLocalPaths),
 
     PingTimeout = case KeepAlive of
@@ -122,7 +125,8 @@ init(Opts) ->
         query_cache_time = QueryCacheTime,
         cap_found_rows = (SetFoundRows =:= true),
         float_as_decimal = FloatAsDecimal,
-        decode_decimal = DecodeDecimal
+        decode_decimal = DecodeDecimal,
+        basic_capabilities = BasicCapabilities
     },
 
     case proplists:get_value(connect_mode, Opts, synchronous) of
@@ -224,8 +228,9 @@ handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
           host = Host, user = User, password = Password, database = Database,
           cap_found_rows = SetFoundRows} = State0) ->
     %% Exchange handshake communication.
+    BasicCapabilities = State0#state.basic_capabilities,
     Result = mysql_protocol:handshake(Host, User, Password, Database, gen_tcp,
-                                      SSLOpts, Socket0, SetFoundRows),
+                                      SSLOpts, Socket0, SetFoundRows, BasicCapabilities),
     case Result of
         {ok, Handshake, SockMod, Socket} ->
             setopts(SockMod, Socket, [{active, once}]),

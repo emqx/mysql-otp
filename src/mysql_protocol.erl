@@ -27,7 +27,7 @@
 %% @private
 -module(mysql_protocol).
 
--export([handshake/8, change_user/8, quit/2, ping/2,
+-export([handshake/8, handshake/9, change_user/8, quit/2, ping/2,
          query/7, fetch_query_response/6, prepare/3, unprepare/3,
          execute/8, fetch_execute_response/6, reset_connnection/2,
          valid_params/1, valid_path/1]).
@@ -69,6 +69,11 @@
 -define(DEFAINE_SSL_VERSIONS, ['tlsv1.2','tlsv1.1','tlsv1']).
 -endif.
 
+handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
+          SetFoundRows) ->
+    handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
+          SetFoundRows, _BasicCapabilities = #{}).
+
 %% @doc Performs a handshake using the supplied socket and socket module for
 %% communication. Returns an ok or an error record. Raises errors when various
 %% unimplemented features are requested.
@@ -77,12 +82,13 @@
                 Database :: iodata() | undefined,
                 SockModule :: module(), SSLOpts :: list() | undefined,
                 Socket :: term(),
-                SetFoundRows :: boolean()) ->
+                SetFoundRows :: boolean(),
+                BasicCapabilities :: #{integer() => boolean()}) ->
     {ok, #handshake{}, SockModule :: module(), Socket :: term()} |
     #error{} | {error, term()}.
 
 handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
-          SetFoundRows) ->
+          SetFoundRows, BasicCapabilities) ->
     SeqNum0 = 0,
     case recv_packet(SockModule0, Socket0, SeqNum0) of
         {error, Reason} -> {error, Reason};
@@ -91,9 +97,9 @@ handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
                 #handshake{} = Handshake ->
                     {ok, SockModule, Socket, SeqNum2} =
                         maybe_do_ssl_upgrade(Host, SockModule0, Socket0, SeqNum1, Handshake,
-                                            SSLOpts, Database, SetFoundRows),
+                                            SSLOpts, Database, SetFoundRows, BasicCapabilities),
                     Response = build_handshake_response(Handshake, Username, Password,
-                                                        Database, SetFoundRows),
+                                                        Database, SetFoundRows, BasicCapabilities),
                     {ok, SeqNum3} = send_packet(SockModule, Socket, Response, SeqNum2),
                     handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket,
                                                     SeqNum3);
@@ -235,27 +241,66 @@ prepare(Query, SockModule, Socket) ->
           StmtId:32/little,
           NumColumns:16/little,
           NumParams:16/little,
+          0 %% reserved_1 -- [00] filler
+          >> ->
+            %% If packet length < 12
+            %% https://dev.mysql.com/doc/dev/mysql-server/9.2.0/page_protocol_com_stmt_prepare.html#sect_protocol_com_stmt_prepare_response
+            continue_prepare_ok(#{
+                stmt_id => StmtId
+               , query => Query
+               , num_params => NumParams
+               , num_columns => NumColumns
+               , warning_count => 0
+               , sock_module => SockModule
+               , socket => Socket
+               , seq_num => SeqNum2
+            });
+        <<?OK,
+          StmtId:32/little,
+          NumColumns:16/little,
+          NumParams:16/little,
           0, %% reserved_1 -- [00] filler
           WarningCount:16/little>> ->
-            %% This was the first packet.
-            %% Now: Parameter Definition Block. The parameter definitions don't
-            %% contain any useful data at all. They are always TYPE_VAR_STRING
-            %% with charset 'binary' so we have to select a type ourselves for
-            %% the parameters we have in execute/4.
-            {_ParamDefs, SeqNum3} =
-                fetch_column_definitions_if_any(NumParams, SockModule, Socket,
-                                                SeqNum2),
-            %% Column Definition Block. We get column definitions in execute
-            %% too, so we don't need them here. We *could* store them to be able
-            %% to provide the user with some info about a prepared statement.
-            {_ColDefs, _SeqNum4} =
-                fetch_column_definitions_if_any(NumColumns, SockModule, Socket,
-                                                SeqNum3),
-            #prepared{statement_id = StmtId,
-                      orig_query = Query,
-                      param_count = NumParams,
-                      warning_count = WarningCount}
+            continue_prepare_ok(#{
+                stmt_id => StmtId
+               , query => Query
+               , num_params => NumParams
+               , num_columns => NumColumns
+               , warning_count => WarningCount
+               , sock_module => SockModule
+               , socket => Socket
+               , seq_num => SeqNum2
+            })
     end.
+
+continue_prepare_ok(Context) ->
+    #{ stmt_id := StmtId
+     , query := Query
+     , num_params := NumParams
+     , num_columns := NumColumns
+     , warning_count := WarningCount
+     , sock_module := SockModule
+     , socket := Socket
+     , seq_num := SeqNum2
+     } = Context,
+    %% This was the first packet.
+    %% Now: Parameter Definition Block. The parameter definitions don't
+    %% contain any useful data at all. They are always TYPE_VAR_STRING
+    %% with charset 'binary' so we have to select a type ourselves for
+    %% the parameters we have in execute/4.
+    {_ParamDefs, SeqNum3} =
+        fetch_column_definitions_if_any(NumParams, SockModule, Socket,
+                                        SeqNum2),
+    %% Column Definition Block. We get column definitions in execute
+    %% too, so we don't need them here. We *could* store them to be able
+    %% to provide the user with some info about a prepared statement.
+    {_ColDefs, _SeqNum4} =
+        fetch_column_definitions_if_any(NumColumns, SockModule, Socket,
+                                        SeqNum3),
+    #prepared{statement_id = StmtId,
+              orig_query = Query,
+              param_count = NumParams,
+              warning_count = WarningCount}.
 
 %% @doc Deallocates a prepared statement.
 -spec unprepare(#prepared{}, module(), term()) -> ok.
@@ -422,19 +467,20 @@ server_version_to_list(ServerVersion) ->
                            Handshake :: #handshake{},
                            SSLOpts :: undefined | list(),
                            Database :: iodata() | undefined,
-                           SetFoundRows :: boolean()) ->
+                           SetFoundRows :: boolean(),
+                           BasicCapabilities :: #{integer() => boolean()}) ->
     {ok, SockModule :: module(), Socket :: term(),
      SeqNum2 :: non_neg_integer()}.
 maybe_do_ssl_upgrade(_Host, SockModule0, Socket0, SeqNum1, _Handshake,
-                     undefined, _Database, _SetFoundRows) ->
+                     undefined, _Database, _SetFoundRows, _BasicCapabilities) ->
     {ok, SockModule0, Socket0, SeqNum1};
 maybe_do_ssl_upgrade(_Host, _SockModule0, _Socket0, _SeqNum1,
                      #handshake{capabilities=Caps},_SSLOpts, _Database,
-                     _SetFoundRows) when Caps band ?CLIENT_SSL =/= ?CLIENT_SSL ->
+                     _SetFoundRows, _BasicCapabilities) when Caps band ?CLIENT_SSL =/= ?CLIENT_SSL ->
     exit({failed_to_upgrade_socket, ssl_not_supported});
 maybe_do_ssl_upgrade(Host, gen_tcp, Socket0, SeqNum1, Handshake, SSLOpts,
-                     Database, SetFoundRows) ->
-    Response = build_handshake_response(Handshake, Database, SetFoundRows),
+                     Database, SetFoundRows, BasicCapabilities) ->
+    Response = build_handshake_response(Handshake, Database, SetFoundRows, BasicCapabilities),
     {ok, SeqNum2} = send_packet(gen_tcp, Socket0, Response, SeqNum1),
     case ssl_connect(Handshake, Host, Socket0, SSLOpts, 5000) of
         {ok, SSLSocket} ->
@@ -478,10 +524,14 @@ merge_ssl_options(DefaultSSLOpts, MandatorySSLOpts, ConfigSSLOpts) ->
 
 %% @doc This function is used when upgrading to encrypted socket. In other,
 %% cases, build_handshake_response/5 is used.
--spec build_handshake_response(#handshake{}, iodata() | undefined, boolean()) ->
+-spec build_handshake_response(#handshake{}, iodata() | undefined, boolean(), #{integer() => boolean()}) ->
     binary().
-build_handshake_response(Handshake, Database, SetFoundRows) ->
-    CapabilityFlags = basic_capabilities(Database /= undefined, SetFoundRows),
+build_handshake_response(Handshake, Database, SetFoundRows, BasicCapabilities0) ->
+    BasicCapabilities = maps:merge(#{
+        ?CLIENT_CONNECT_WITH_DB => Database /= undefined,
+        ?CLIENT_FOUND_ROWS => SetFoundRows
+    }, BasicCapabilities0),
+    CapabilityFlags = basic_capabilities2(BasicCapabilities),
     verify_server_capabilities(Handshake, CapabilityFlags),
     ClientCapabilities = add_client_capabilities(CapabilityFlags),
     ClientSSLCapabilities = ClientCapabilities bor ?CLIENT_SSL,
@@ -494,11 +544,15 @@ build_handshake_response(Handshake, Database, SetFoundRows) ->
 %% @doc The response sent by the client to the server after receiving the
 %% initial handshake from the server
 -spec build_handshake_response(#handshake{}, iodata(), iodata(),
-                               iodata() | undefined, boolean()) ->
+                               iodata() | undefined, boolean(), #{integer() => boolean()}) ->
     binary().
 build_handshake_response(Handshake, Username, Password, Database,
-                         SetFoundRows) ->
-    CapabilityFlags = basic_capabilities(Database /= undefined, SetFoundRows),
+                         SetFoundRows, BasicCapabilities0) ->
+    BasicCapabilities = maps:merge(#{
+        ?CLIENT_CONNECT_WITH_DB => Database /= undefined,
+        ?CLIENT_FOUND_ROWS => SetFoundRows
+    }, BasicCapabilities0),
+    CapabilityFlags = basic_capabilities2(BasicCapabilities),
     verify_server_capabilities(Handshake, CapabilityFlags),
     %% Add some extra capability flags only for signalling to the server what
     %% the client wants to do. The server doesn't say it handles them although
@@ -549,6 +603,17 @@ basic_capabilities(ConnectWithDB, SetFoundRows) ->
         true -> CapabilityFlags1 bor ?CLIENT_FOUND_ROWS;
         _    -> CapabilityFlags1
     end.
+
+basic_capabilities2(Flags0) ->
+    DefaultKeys = [?CLIENT_PROTOCOL_41, ?CLIENT_TRANSACTIONS, ?CLIENT_SECURE_CONNECTION],
+    Defaults = maps:from_keys(DefaultKeys, true),
+    Flags = maps:merge(Defaults, Flags0),
+    maps:fold(
+      fun(_Flag, false, Acc) -> Acc;
+         (Flag, true, Acc) -> Acc bor Flag
+      end,
+      0,
+      Flags).
 
 -spec add_client_capabilities(Caps :: integer()) -> integer().
 add_client_capabilities(Caps) ->
