@@ -41,7 +41,7 @@
 -define(default_connect_timeout, 5000).
 -define(default_query_timeout, infinity).
 -define(default_query_cache_time, 60000). %% for query/3.
--define(default_ping_timeout, 60000).
+-define(default_ping_interval, 60000).
 
 -define(cmd_timeout, 3000). %% Timeout used for various commands to the server
 
@@ -58,7 +58,7 @@
                 host, port, user, password, database, queries, prepares,
                 auth_plugin_name, auth_plugin_data, allowed_local_paths,
                 log_warnings, log_slow_queries,
-                connect_timeout, ping_timeout, query_timeout, query_cache_time,
+                connect_timeout, ping_interval, query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
                 stmts = #{}, query_cache = mysql_cache:new(), cap_found_rows = false,
@@ -104,8 +104,8 @@ init(Opts) ->
 
     true = lists:all(fun mysql_protocol:valid_path/1, AllowedLocalPaths),
 
-    PingTimeout = case KeepAlive of
-        true         -> ?default_ping_timeout;
+    PingInterval = case KeepAlive of
+        true         -> ?default_ping_interval;
         false        -> infinity;
         N when N > 0 -> N
     end,
@@ -120,7 +120,7 @@ init(Opts) ->
         queries = Queries, prepares = Prepares,
         log_warnings = LogWarn, log_slow_queries = LogSlow,
         connect_timeout = ConnectTimeout,
-        ping_timeout = PingTimeout,
+        ping_interval = PingInterval,
         query_timeout = QueryTimeout,
         query_cache_time = QueryCacheTime,
         cap_found_rows = (SetFoundRows =:= true),
@@ -786,9 +786,9 @@ handle_query_call_result([Rec|Recs], RecNum, Query,
     end.
 
 %% @doc Schedules (or re-schedules) ping.
-schedule_ping(State = #state{ping_timeout = infinity}) ->
+schedule_ping(State = #state{ping_interval = infinity}) ->
     State;
-schedule_ping(State = #state{ping_timeout = Timeout, ping_ref = Ref}) ->
+schedule_ping(State = #state{ping_interval = Timeout, ping_ref = Ref}) ->
     is_reference(Ref) andalso erlang:cancel_timer(Ref),
     State#state{ping_ref = erlang:send_after(Timeout, self(), ping)}.
 
