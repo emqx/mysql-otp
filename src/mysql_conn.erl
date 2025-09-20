@@ -42,6 +42,7 @@
 -define(default_query_timeout, infinity).
 -define(default_query_cache_time, 60000). %% for query/3.
 -define(default_ping_interval, 60000).
+-define(default_send_timeout, 5000).
 
 -define(cmd_timeout, 3000). %% Timeout used for various commands to the server
 
@@ -222,7 +223,11 @@ sanitize_tcp_opts(Host, TcpOpts0) ->
         true -> [{nodelay, true} | TcpOpts1];
         false -> TcpOpts1
     end,
-    [binary, {packet, raw}, {active, false} | TcpOpts2].
+    TcpOpts3 = case lists:keymember(send_timeout, 1, TcpOpts2) of
+        true -> TcpOpts2;
+        false -> [{send_timeout, ?default_send_timeout} | TcpOpts2]
+    end,
+    [binary, {packet, raw}, {active, false} | TcpOpts3].
 
 handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
           host = Host, user = User, password = Password, database = Database,
