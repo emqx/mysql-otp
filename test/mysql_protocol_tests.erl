@@ -106,7 +106,7 @@ prepare_test() ->
         "0c 3f 00 00 00 00 00 fd    80 00 1f 00 00|05 00 00    .?.............."
         "06 fe 00 00 02 00                                     ......"),
     Sock = mock_tcp:create([{send, ExpectedReq}, {recv, ExpectedResp}]),
-    Result = mysql_protocol:prepare(Query, mock_tcp, Sock),
+    Result = mysql_protocol:prepare(Query, mock_tcp, Sock, infinity),
     mock_tcp:close(Sock),
     ?assertMatch(#prepared{statement_id = StmtId,
                            param_count = 2,
@@ -119,7 +119,7 @@ bad_protocol_version_test() ->
     SSLOpts = undefined,
     ?assertError(unknown_protocol,
                  mysql_protocol:handshake("foo", "bar", "baz", "db", mock_tcp,
-                                          SSLOpts, Sock, false)),
+                                          SSLOpts, Sock, false, infinity)),
     mock_tcp:close(Sock).
 
 error_as_initial_packet_test() ->
@@ -132,7 +132,7 @@ error_as_initial_packet_test() ->
     SSLOpts = undefined,
     ?assertMatch(#error{code = 1040, msg = <<"Too many connections">>},
                  mysql_protocol:handshake("foo", "bar", "baz", "db", mock_tcp,
-                                          SSLOpts, Sock, false)),
+                                          SSLOpts, Sock, false, infinity)),
     mock_tcp:close(Sock).
 
 %% --- Helper functions for the above tests ---

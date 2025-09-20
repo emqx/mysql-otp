@@ -27,9 +27,9 @@
 %% @private
 -module(mysql_protocol).
 
--export([handshake/8, handshake/9, change_user/8, quit/2, ping/2,
-         query/7, fetch_query_response/6, prepare/3, unprepare/3,
-         execute/8, fetch_execute_response/6, reset_connnection/2,
+-export([handshake/9, handshake/10, change_user/9, quit/3, ping/3,
+         query/7, fetch_query_response/6, prepare/4, unprepare/3,
+         execute/8, fetch_execute_response/6, reset_connnection/3,
          valid_params/1, valid_path/1]).
 
 -export([maybe_parse_error_packet/1]).
@@ -70,9 +70,9 @@
 -endif.
 
 handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
-          SetFoundRows) ->
+          SetFoundRows, Timeout) ->
     handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
-          SetFoundRows, _BasicCapabilities = #{}).
+          SetFoundRows, #{}, Timeout).
 
 %% @doc Performs a handshake using the supplied socket and socket module for
 %% communication. Returns an ok or an error record. Raises errors when various
@@ -83,14 +83,15 @@ handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
                 SockModule :: module(), SSLOpts :: list() | undefined,
                 Socket :: term(),
                 SetFoundRows :: boolean(),
-                BasicCapabilities :: #{integer() => boolean()}) ->
+                BasicCapabilities :: #{integer() => boolean()},
+                Timeout :: timeout()) ->
     {ok, #handshake{}, SockModule :: module(), Socket :: term()} |
     #error{} | {error, term()}.
 
 handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
-          SetFoundRows, BasicCapabilities) ->
+          SetFoundRows, BasicCapabilities, Timeout) ->
     SeqNum0 = 0,
-    case recv_packet(SockModule0, Socket0, SeqNum0) of
+    case recv_packet(SockModule0, Socket0, Timeout, SeqNum0) of
         {error, Reason} -> {error, Reason};
         {ok, HandshakePacket, SeqNum1} ->
             case parse_handshake(HandshakePacket) of
@@ -102,20 +103,20 @@ handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
                                                         Database, SetFoundRows, BasicCapabilities),
                     {ok, SeqNum3} = send_packet(SockModule, Socket, Response, SeqNum2),
                     handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket,
-                                                    SeqNum3);
+                                                    SeqNum3, Timeout);
                 #error{} = Error ->
                     Error
             end
     end.
 
 
-handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum) ->
+handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum, Timeout) ->
     #handshake{auth_plugin_name = AuthPluginName,
                auth_plugin_data = AuthPluginData,
                server_version = ServerVersion,
                status = Status} = Handshake,
     AuthResult = auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
-                                       SockModule, Socket, ServerVersion, SeqNum),
+                                       SockModule, Socket, ServerVersion, SeqNum, Timeout),
     case AuthResult of
         #ok{status = OkStatus} ->
             %% check status, ignoring bits
@@ -144,8 +145,8 @@ handshake_finish_or_switch_auth(Handshake, Password, SockModule, Socket, SeqNum)
 %% auth method. The packet contains the name of the auth method to switch to,
 %% and new auth plugin data.
 auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
-                      SockModule, Socket, ServerVersion, SeqNum0) ->
-    {ok, ConfirmPacket, SeqNum1} = recv_packet(SockModule, Socket, SeqNum0),
+                      SockModule, Socket, ServerVersion, SeqNum0, Timeout) ->
+    {ok, ConfirmPacket, SeqNum1} = recv_packet(SockModule, Socket, Timeout, SeqNum0),
     case parse_handshake_confirm(ConfirmPacket) of
         #ok{} = Ok ->
             %% Authentication success.
@@ -160,12 +161,12 @@ auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
             Hash = hash_password(SwitchAuthPluginName, Password, SwitchAuthPluginData),
             {ok, SeqNum2} = send_packet(SockModule, Socket, Hash, SeqNum1),
             auth_finish_or_switch(SwitchAuthPluginName, SwitchAuthPluginData, Password,
-                                  SockModule, Socket, ServerVersion, SeqNum2);
+                                  SockModule, Socket, ServerVersion, SeqNum2, Timeout);
         fast_auth_completed ->
             %% Server signals success by fast authentication (probably specific to
             %% the caching_sha2_password method). This will be followed by an OK Packet.
             auth_finish_or_switch(AuthPluginName, AuthPluginData, Password, SockModule,
-                                  Socket, ServerVersion, SeqNum1);
+                                  Socket, ServerVersion, SeqNum1, Timeout);
         full_auth_requested when SockModule =:= ssl ->
             %% Server wants full authentication (probably specific to the
             %% caching_sha2_password method), and we are on a secure channel since
@@ -177,7 +178,7 @@ auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
             end,
             {ok, SeqNum2} = send_packet(SockModule, Socket, <<Password1/binary, 0>>, SeqNum1),
             auth_finish_or_switch(AuthPluginName, AuthPluginData, Password, SockModule,
-                                  Socket, ServerVersion, SeqNum2);
+                                  Socket, ServerVersion, SeqNum2, Timeout);
         full_auth_requested ->
             %% Server wants full authentication (probably specific to the
             %% caching_sha2_password method), and we are not on a secure channel.
@@ -185,7 +186,7 @@ auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
             %% public key, we must ask for it by sending a single byte "2".
             {ok, SeqNum2} = send_packet(SockModule, Socket, <<2:8>>, SeqNum1),
             auth_finish_or_switch(AuthPluginName, AuthPluginData, Password, SockModule,
-                                  Socket, ServerVersion, SeqNum2);
+                                  Socket, ServerVersion, SeqNum2, Timeout);
         {public_key, PubKey} ->
             %% Server has sent its public key (certainly specific to the caching_sha2_password
             %% method). We encrypt the password with the public key we received and send
@@ -194,24 +195,24 @@ auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
                                                  ServerVersion),
             {ok, SeqNum2} = send_packet(SockModule, Socket, EncryptedPassword, SeqNum1),
             auth_finish_or_switch(AuthPluginName, AuthPluginData, Password, SockModule,
-                                  Socket, ServerVersion, SeqNum2);
+                                  Socket, ServerVersion, SeqNum2, Timeout);
         Error ->
             %% Authentication failure.
             Error
     end.
 
--spec quit(module(), term()) -> ok.
-quit(SockModule, Socket) ->
+-spec quit(module(), term(), timeout()) -> ok.
+quit(SockModule, Socket, Timeout) ->
     {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_QUIT>>, 0),
-    case recv_packet(SockModule, Socket, SeqNum1) of
+    case recv_packet(SockModule, Socket, Timeout, SeqNum1) of
         {error, closed} -> ok;            %% MySQL 5.5.40 and more
         {ok, ?ok_pattern, _SeqNum2} -> ok %% Some older MySQL versions?
     end.
 
--spec ping(module(), term()) -> #ok{}.
-ping(SockModule, Socket) ->
+-spec ping(module(), term(), timeout()) -> #ok{}.
+ping(SockModule, Socket, Timeout) ->
     {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_PING>>, 0),
-    {ok, OkPacket, _SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
+    {ok, OkPacket, _SeqNum2} = recv_packet(SockModule, Socket, Timeout, SeqNum1),
     parse_ok_packet(OkPacket).
 
 -spec query(Query :: iodata(), module(), term(), [binary()],
@@ -229,11 +230,11 @@ fetch_query_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMap,
     fetch_response(SockModule, Socket, Timeout, text, AllowedPaths, DecodeDecimal, FilterMap, []).
 
 %% @doc Prepares a statement.
--spec prepare(iodata(), module(), term()) -> #error{} | #prepared{}.
-prepare(Query, SockModule, Socket) ->
+-spec prepare(iodata(), module(), term(), timeout()) -> #error{} | #prepared{}.
+prepare(Query, SockModule, Socket, Timeout) ->
     Req = <<?COM_STMT_PREPARE, (iolist_to_binary(Query))/binary>>,
     {ok, SeqNum1} = send_packet(SockModule, Socket, Req, 0),
-    {ok, Resp, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
+    {ok, Resp, SeqNum2} = recv_packet(SockModule, Socket, Timeout, SeqNum1),
     case Resp of
         ?error_pattern ->
             parse_error_packet(Resp);
@@ -254,6 +255,7 @@ prepare(Query, SockModule, Socket) ->
                , sock_module => SockModule
                , socket => Socket
                , seq_num => SeqNum2
+               , timeout => Timeout
             });
         <<?OK,
           StmtId:32/little,
@@ -270,6 +272,7 @@ prepare(Query, SockModule, Socket) ->
                , sock_module => SockModule
                , socket => Socket
                , seq_num => SeqNum2
+               , timeout => Timeout
             })
     end.
 
@@ -282,6 +285,7 @@ continue_prepare_ok(Context) ->
      , sock_module := SockModule
      , socket := Socket
      , seq_num := SeqNum2
+     , timeout := Timeout
      } = Context,
     %% This was the first packet.
     %% Now: Parameter Definition Block. The parameter definitions don't
@@ -290,13 +294,13 @@ continue_prepare_ok(Context) ->
     %% the parameters we have in execute/4.
     {_ParamDefs, SeqNum3} =
         fetch_column_definitions_if_any(NumParams, SockModule, Socket,
-                                        SeqNum2),
+                                        SeqNum2, Timeout),
     %% Column Definition Block. We get column definitions in execute
     %% too, so we don't need them here. We *could* store them to be able
     %% to provide the user with some info about a prepared statement.
     {_ColDefs, _SeqNum4} =
         fetch_column_definitions_if_any(NumColumns, SockModule, Socket,
-                                        SeqNum3),
+                                        SeqNum3, Timeout),
     #prepared{statement_id = StmtId,
               orig_query = Query,
               param_count = NumParams,
@@ -351,9 +355,9 @@ fetch_execute_response(SockModule, Socket, AllowedPaths, DecodeDecimal, FilterMa
 
 %% @doc Changes the user of the connection.
 -spec change_user(module(), term(), iodata(), iodata(), binary(), binary(),
-                  undefined | iodata(), [integer()]) -> #ok{} | #error{}.
+                  undefined | iodata(), [integer()], timeout()) -> #ok{} | #error{}.
 change_user(SockModule, Socket, Username, Password, AuthPluginName, AuthPluginData,
-            Database, ServerVersion) ->
+            Database, ServerVersion, Timeout) ->
     DbBin = case Database of
         undefined -> <<>>;
         _ -> iolist_to_binary(Database)
@@ -370,12 +374,12 @@ change_user(SockModule, Socket, Username, Password, AuthPluginName, AuthPluginDa
     end,
     {ok, SeqNum1} = send_packet(SockModule, Socket, Req1, 0),
     auth_finish_or_switch(AuthPluginName, AuthPluginData, Password,
-                          SockModule, Socket, ServerVersion, SeqNum1).
+                          SockModule, Socket, ServerVersion, SeqNum1, Timeout).
 
--spec reset_connnection(module(), term()) -> #ok{}|#error{}.
-reset_connnection(SockModule, Socket) ->
+-spec reset_connnection(module(), term(), timeout()) -> #ok{}|#error{}.
+reset_connnection(SockModule, Socket, Timeout) ->
     {ok, SeqNum1} = send_packet(SockModule, Socket, <<?COM_RESET_CONNECTION>>, 0),
-    {ok, Packet, _SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
+    {ok, Packet, _SeqNum2} = recv_packet(SockModule, Socket, Timeout, SeqNum1),
     case Packet of
         ?ok_pattern ->
             parse_ok_packet(Packet);
@@ -563,7 +567,10 @@ build_handshake_response(Handshake, Username, Password, Database,
     Hash = hash_password(AuthPluginName, Password, AuthPluginData),
     HashLength = size(Hash),
     CharacterSet = character_set(Handshake#handshake.server_version),
-    UsernameUtf8 = unicode:characters_to_binary(Username),
+    UsernameUtf8 = case unicode:characters_to_binary(Username) of
+        Bin when is_binary(Bin) -> Bin;
+        {error, Bin, _} -> error({not_utf8_username, Bin})
+    end,
     DbBin = case Database of
         undefined -> <<>>;
         _         -> <<(iolist_to_binary(Database))/binary, 0>>
@@ -701,7 +708,7 @@ fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, DecodeDecimal, 
                     %% The first packet in a resultset is only the column count.
                     {ColCount, <<>>} = lenenc_int(ResultPacket),
                     fetch_resultset(SockModule, Socket, ColCount, Proto,
-                                    DecodeDecimal, FilterMap, SeqNum2)
+                                    DecodeDecimal, FilterMap, SeqNum2, Timeout)
             end,
             Acc1 = [Result | Acc],
             case more_results_exists(Result) of
@@ -717,18 +724,18 @@ fetch_response(SockModule, Socket, Timeout, Proto, AllowedPaths, DecodeDecimal, 
 
 %% @doc Fetches a result set.
 -spec fetch_resultset(module(), term(), integer(), text | binary,
-                      decode_decimal(), query_filtermap(), integer()) ->
+                      decode_decimal(), query_filtermap(), integer(), timeout()) ->
     #resultset{} | #error{}.
-fetch_resultset(SockModule, Socket, FieldCount, Proto, DecodeDecimal, FilterMap, SeqNum0) ->
+fetch_resultset(SockModule, Socket, FieldCount, Proto, DecodeDecimal, FilterMap, SeqNum0, Timeout) ->
     {ok, ColDefs0, SeqNum1} = fetch_column_definitions(SockModule, Socket,
-                                                       SeqNum0, FieldCount, []),
-    {ok, DelimPacket, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
+                                                       SeqNum0, FieldCount, [], Timeout),
+    {ok, DelimPacket, SeqNum2} = recv_packet(SockModule, Socket, Timeout, SeqNum1),
     #eof{} = parse_eof_packet(DelimPacket),
     ColDefs1 = lists:map(fun(ColDef) ->
                                  parse_column_definition(ColDef, DecodeDecimal)
                          end, ColDefs0),
     case fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs1, Proto,
-                              FilterMap, SeqNum2, []) of
+                              FilterMap, SeqNum2, [], Timeout) of
         {ok, Rows, _SeqNum3, #eof{status = S, warning_count = W}} ->
             #resultset{cols = ColDefs1, rows = Rows, status = S,
                        warning_count = W};
@@ -739,11 +746,11 @@ fetch_resultset(SockModule, Socket, FieldCount, Proto, DecodeDecimal, FilterMap,
 %% @doc Fetches the rows for a result set and decodes them using either the text
 %% format (for plain queries) or binary format (for prepared statements).
 -spec fetch_resultset_rows(module(), term(), integer(), [#col{}], text | binary,
-                           query_filtermap(), integer(), [[term()]]) ->
+                           query_filtermap(), integer(), [[term()]], timeout()) ->
     {ok, [[term()]], integer(), #eof{}} | #error{}.
 fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs, Proto,
-                     FilterMap, SeqNum0, Acc) ->
-    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, SeqNum0),
+                     FilterMap, SeqNum0, Acc, Timeout) ->
+    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, Timeout, SeqNum0),
     case Packet of
         ?error_pattern ->
             parse_error_packet(Packet);
@@ -761,7 +768,7 @@ fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs, Proto,
                     [Row1|Acc]
             end,
             fetch_resultset_rows(SockModule, Socket, FieldCount, ColDefs,
-                                 Proto, FilterMap, SeqNum1, Acc1)
+                                 Proto, FilterMap, SeqNum1, Acc1, Timeout)
     end.
 
 -spec filtermap_resultset_row(query_filtermap(), [#col{}], [term()]) ->
@@ -783,14 +790,14 @@ more_results_exists(#resultset{status = S}) ->
 %% @doc Receives NumLeft column definition packets. They are not parsed.
 %% @see parse_column_definition/1
 -spec fetch_column_definitions(module(), term(), SeqNum :: integer(),
-                               NumLeft :: integer(), Acc :: [binary()]) ->
+                               NumLeft :: integer(), Acc :: [binary()], timeout()) ->
     {ok, ColDefPackets :: [binary()], NextSeqNum :: integer()}.
-fetch_column_definitions(SockModule, Socket, SeqNum, NumLeft, Acc)
+fetch_column_definitions(SockModule, Socket, SeqNum, NumLeft, Acc, Timeout)
   when NumLeft > 0 ->
-    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, SeqNum),
+    {ok, Packet, SeqNum1} = recv_packet(SockModule, Socket, Timeout, SeqNum),
     fetch_column_definitions(SockModule, Socket, SeqNum1, NumLeft - 1,
-                             [Packet | Acc]);
-fetch_column_definitions(_SockModule, _Socket, SeqNum, 0, Acc) ->
+                             [Packet | Acc], Timeout);
+fetch_column_definitions(_SockModule, _Socket, SeqNum, 0, Acc, _Timeout) ->
     {ok, lists:reverse(Acc), SeqNum}.
 
 %% Parses a packet containing a column definition (part of a result set)
@@ -925,12 +932,12 @@ decode_text(#col{type = T}, Text) when T == ?TYPE_FLOAT;
 
 %% @doc If NumColumns is non-zero, fetches this number of column definitions
 %% and an EOF packet. Used by prepare/3.
-fetch_column_definitions_if_any(0, _SockModule, _Socket, SeqNum) ->
+fetch_column_definitions_if_any(0, _SockModule, _Socket, SeqNum, _Timeout) ->
     {[], SeqNum};
-fetch_column_definitions_if_any(N, SockModule, Socket, SeqNum) ->
+fetch_column_definitions_if_any(N, SockModule, Socket, SeqNum, Timeout) ->
     {ok, Defs, SeqNum1} = fetch_column_definitions(SockModule, Socket, SeqNum,
-                                                   N, []),
-    {ok, ?eof_pattern, SeqNum2} = recv_packet(SockModule, Socket, SeqNum1),
+                                                   N, [], Timeout),
+    {ok, ?eof_pattern, SeqNum2} = recv_packet(SockModule, Socket, Timeout, SeqNum1),
     {Defs, SeqNum2}.
 
 %% @doc Decodes a packet representing a row in a binary result set.
@@ -1331,11 +1338,8 @@ send_packet(SockModule, Socket, Data, SeqNum) ->
     ok = SockModule:send(Socket, WithHeaders),
     {ok, SeqNum1}.
 
-%% @see recv_packet/4
-recv_packet(SockModule, Socket, SeqNum) ->
-    recv_packet(SockModule, Socket, infinity, SeqNum).
 
-%% @doc Receives data by calling SockModule:recv/2 and removes the packet
+%% @doc Receives data by calling SockModule:recv/3 and removes the packet
 %% headers. Returns the packet contents and the next packet sequence number.
 -spec recv_packet(module(), term(), timeout(), integer() | any) ->
     {ok, Data :: binary(), NextSeqNum :: integer()} | {error, term()}.
