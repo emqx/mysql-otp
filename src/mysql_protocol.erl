@@ -531,7 +531,7 @@ build_handshake_response(Handshake, Database, SetFoundRows, BasicCapabilities0) 
         ?CLIENT_CONNECT_WITH_DB => Database /= undefined,
         ?CLIENT_FOUND_ROWS => SetFoundRows
     }, BasicCapabilities0),
-    CapabilityFlags = basic_capabilities2(BasicCapabilities),
+    CapabilityFlags = basic_capabilities(BasicCapabilities),
     verify_server_capabilities(Handshake, CapabilityFlags),
     ClientCapabilities = add_client_capabilities(CapabilityFlags),
     ClientSSLCapabilities = ClientCapabilities bor ?CLIENT_SSL,
@@ -552,7 +552,7 @@ build_handshake_response(Handshake, Username, Password, Database,
         ?CLIENT_CONNECT_WITH_DB => Database /= undefined,
         ?CLIENT_FOUND_ROWS => SetFoundRows
     }, BasicCapabilities0),
-    CapabilityFlags = basic_capabilities2(BasicCapabilities),
+    CapabilityFlags = basic_capabilities(BasicCapabilities),
     verify_server_capabilities(Handshake, CapabilityFlags),
     %% Add some extra capability flags only for signalling to the server what
     %% the client wants to do. The server doesn't say it handles them although
@@ -589,22 +589,7 @@ verify_server_capabilities(Handshake, CapabilityFlags) ->
     Handshake#handshake.capabilities band CapabilityFlags == CapabilityFlags
         orelse error(old_server_version).
 
--spec basic_capabilities(ConnectWithDB :: boolean(),
-                         SetFoundRows :: boolean()) -> integer().
-basic_capabilities(ConnectWithDB, SetFoundRows) ->
-    CapabilityFlags0 = ?CLIENT_PROTOCOL_41 bor
-                       ?CLIENT_TRANSACTIONS bor
-                       ?CLIENT_SECURE_CONNECTION,
-    CapabilityFlags1 = case ConnectWithDB of
-                           true -> CapabilityFlags0 bor ?CLIENT_CONNECT_WITH_DB;
-                           _ -> CapabilityFlags0
-                       end,
-    case SetFoundRows of
-        true -> CapabilityFlags1 bor ?CLIENT_FOUND_ROWS;
-        _    -> CapabilityFlags1
-    end.
-
-basic_capabilities2(Flags0) ->
+basic_capabilities(Flags0) ->
     DefaultKeys = [?CLIENT_PROTOCOL_41, ?CLIENT_TRANSACTIONS, ?CLIENT_SECURE_CONNECTION],
     Defaults = maps:from_keys(DefaultKeys, true),
     Flags = maps:merge(Defaults, Flags0),
