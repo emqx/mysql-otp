@@ -63,7 +63,7 @@
                 transaction_levels = [], ping_ref = undefined,
                 stmts = #{}, query_cache = mysql_cache:new(), cap_found_rows = false,
                 float_as_decimal = false, decode_decimal = auto,
-                basic_capabilities = #{}}).
+                basic_capabilities = #{}, try_kill_slow_query = true}).
 
 %% @private
 init(Opts) ->
@@ -101,6 +101,7 @@ init(Opts) ->
     DecodeDecimal     = proplists:get_value(decode_decimal, Opts, auto),
 
     BasicCapabilities = proplists:get_value(basic_capabilities, Opts, #{}),
+    TryKillSlowQuery  = proplists:get_value(try_kill_slow_query, Opts, true),
 
     true = lists:all(fun mysql_protocol:valid_path/1, AllowedLocalPaths),
 
@@ -126,7 +127,8 @@ init(Opts) ->
         cap_found_rows = (SetFoundRows =:= true),
         float_as_decimal = FloatAsDecimal,
         decode_decimal = DecodeDecimal,
-        basic_capabilities = BasicCapabilities
+        basic_capabilities = BasicCapabilities,
+        try_kill_slow_query = TryKillSlowQuery
     },
 
     case proplists:get_value(connect_mode, Opts, synchronous) of
@@ -636,13 +638,12 @@ execute_stmt(Stmt, Args, FilterMap, Timeout, State) ->
     {ok, Recs} = case mysql_protocol:execute(Stmt, Args1, SockMod, Socket,
                                              AllowedPaths, DecodeDecimal,
                                              FilterMap, Timeout) of
-        {error, timeout} when State#state.server_version >= [5, 0, 0] ->
-            kill_query(State),
-            mysql_protocol:fetch_execute_response(SockMod, Socket, [],
-                                                  DecodeDecimal, FilterMap,
-                                                  ?cmd_timeout);
         {error, Reason} ->
-            exit(Reason);
+            recover_from_slow_query(State, Reason, fun() ->
+                mysql_protocol:fetch_execute_response(SockMod, Socket, [],
+                                                      DecodeDecimal, FilterMap,
+                                                      ?cmd_timeout)
+            end);
         QueryResult ->
             QueryResult
     end,
@@ -696,13 +697,12 @@ query(Query, FilterMap, Timeout, State) ->
     Result = mysql_protocol:query(Query, SockMod, Socket, AllowedPaths,
                                   DecodeDecimal, FilterMap, Timeout),
     {ok, Recs} = case Result of
-        {error, timeout} when State#state.server_version >= [5, 0, 0] ->
-            kill_query(State),
-            mysql_protocol:fetch_query_response(SockMod, Socket,
-                                                [], DecodeDecimal, FilterMap,
-                                                ?cmd_timeout);
         {error, Reason} ->
-            exit(Reason);
+            recover_from_slow_query(State, Reason, fun() ->
+                mysql_protocol:fetch_query_response(SockMod, Socket,
+                                                    [], DecodeDecimal, FilterMap,
+                                                    ?cmd_timeout)
+            end);
         QueryResult ->
             QueryResult
     end,
@@ -711,6 +711,17 @@ query(Query, FilterMap, Timeout, State) ->
     State1#state.warning_count > 0 andalso State1#state.log_warnings
         andalso log_warnings(State1, Query),
     handle_query_call_result(Recs, Query, State1).
+
+recover_from_slow_query(#state{try_kill_slow_query = false}, Reason, _Fun) ->
+    exit(Reason);
+recover_from_slow_query(#state{server_version = ServerVersion}, Reason, _Fun)
+    when ServerVersion < [5, 0, 0] ->
+    exit(Reason);
+recover_from_slow_query(State, timeout, Fun) ->
+    kill_query(State),
+    Fun();
+recover_from_slow_query(_State, _FilterMap, Reason) ->
+    exit(Reason).
 
 %% @doc Prepares a named query and returns {{ok, Name}, NewState} or
 %% {{error, Reason}, NewState}.
