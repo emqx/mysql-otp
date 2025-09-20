@@ -36,7 +36,7 @@ fi
 # the host has no mysql user, issue a docker run command to change owner
 docker run --rm -t -v "$(pwd)/${BASEDIR}/certs:${MYSQL_CERTS_DIR}" "${MYSQL_IMAGE}:${MYSQL_VERSION}" chown -R mysql:mysql "${MYSQL_CERTS_DIR}"
 # now start mysql with config files and certificate files mouted as volumes
-docker compose -f "${BASEDIR}"/docker-compose.yml up -d --wait
+docker compose -f "${BASEDIR}"/docker-compose.yml up -d --wait --force-recreate --build
 
 # wait for mysqld to be ready
 is_mysqld_ready() {

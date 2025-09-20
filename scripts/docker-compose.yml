@@ -23,3 +23,15 @@ services:
       - type: bind
         source: ./init.sh
         target: /init.sh
+  toxiproxy:
+    image: shopify/toxiproxy:2.1.0
+    ports:
+      - "33306:33306"
+      - "8474:8474"  # ToxiProxy API
+    command: -host 0.0.0.0 -config /etc/toxiproxy/toxiproxy.json
+    volumes:
+      - type: bind
+        source: ./toxiproxy.json
+        target: /etc/toxiproxy/toxiproxy.json
+    depends_on:
+      - mysql
