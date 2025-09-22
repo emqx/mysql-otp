@@ -63,12 +63,6 @@
 -define(authmethod_sha256_password, <<"sha256_password">>).
 -define(authmethod_caching_sha2_password, <<"caching_sha2_password">>).
 
--if(?OTP_RELEASE >= 23).
--define(DEFAINE_SSL_VERSIONS, ['tlsv1.3','tlsv1.2','tlsv1.1']).
--else.
--define(DEFAINE_SSL_VERSIONS, ['tlsv1.2','tlsv1.1','tlsv1']).
--endif.
-
 handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
           SetFoundRows, Timeout) ->
     handshake(Host, Username, Password, Database, SockModule0, SSLOpts, Socket0,
