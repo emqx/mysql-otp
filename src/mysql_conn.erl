@@ -41,7 +41,8 @@
 -define(default_connect_timeout, 5000).
 -define(default_query_timeout, infinity).
 -define(default_query_cache_time, 60000). %% for query/3.
--define(default_ping_timeout, 60000).
+-define(default_ping_interval, 60000).
+-define(default_send_timeout, 5000).
 
 -define(cmd_timeout, 3000). %% Timeout used for various commands to the server
 
@@ -58,7 +59,7 @@
                 host, port, user, password, database, queries, prepares,
                 auth_plugin_name, auth_plugin_data, allowed_local_paths,
                 log_warnings, log_slow_queries,
-                connect_timeout, ping_timeout, query_timeout, query_cache_time,
+                connect_timeout, ping_interval, query_timeout, query_cache_time,
                 affected_rows = 0, status = 0, warning_count = 0, insert_id = 0,
                 transaction_levels = [], ping_ref = undefined,
                 stmts = #{}, query_cache = mysql_cache:new(), cap_found_rows = false,
@@ -104,8 +105,8 @@ init(Opts) ->
 
     true = lists:all(fun mysql_protocol:valid_path/1, AllowedLocalPaths),
 
-    PingTimeout = case KeepAlive of
-        true         -> ?default_ping_timeout;
+    PingInterval = case KeepAlive of
+        true         -> ?default_ping_interval;
         false        -> infinity;
         N when N > 0 -> N
     end,
@@ -120,7 +121,7 @@ init(Opts) ->
         queries = Queries, prepares = Prepares,
         log_warnings = LogWarn, log_slow_queries = LogSlow,
         connect_timeout = ConnectTimeout,
-        ping_timeout = PingTimeout,
+        ping_interval = PingInterval,
         query_timeout = QueryTimeout,
         query_cache_time = QueryCacheTime,
         cap_found_rows = (SetFoundRows =:= true),
@@ -222,15 +223,19 @@ sanitize_tcp_opts(Host, TcpOpts0) ->
         true -> [{nodelay, true} | TcpOpts1];
         false -> TcpOpts1
     end,
-    [binary, {packet, raw}, {active, false} | TcpOpts2].
+    TcpOpts3 = case lists:keymember(send_timeout, 1, TcpOpts2) of
+        true -> TcpOpts2;
+        false -> [{send_timeout, ?default_send_timeout} | TcpOpts2]
+    end,
+    [binary, {packet, raw}, {active, false} | TcpOpts3].
 
 handshake(#state{socket = Socket0, ssl_opts = SSLOpts,
           host = Host, user = User, password = Password, database = Database,
-          cap_found_rows = SetFoundRows} = State0) ->
+          cap_found_rows = SetFoundRows, connect_timeout = Timeout} = State0) ->
     %% Exchange handshake communication.
     BasicCapabilities = State0#state.basic_capabilities,
     Result = mysql_protocol:handshake(Host, User, Password, Database, gen_tcp,
-                                      SSLOpts, Socket0, SetFoundRows, BasicCapabilities),
+                                      SSLOpts, Socket0, SetFoundRows, BasicCapabilities, Timeout),
     case Result of
         {ok, Handshake, SockMod, Socket} ->
             setopts(SockMod, Socket, [{active, once}]),
@@ -358,7 +363,7 @@ handle_call({param_query, Query, Params, FilterMap, Timeout}, _From,
         not_found ->
             %% Prepare
             setopts(SockMod, Socket, [{active, false}]),
-            Rec = mysql_protocol:prepare(Query, SockMod, Socket),
+            Rec = mysql_protocol:prepare(Query, SockMod, Socket, ?cmd_timeout),
             setopts(SockMod, Socket, [{active, once}]),
             case Rec of
                 #error{} = E ->
@@ -399,7 +404,7 @@ handle_call({execute, Stmt, Args, FilterMap, Timeout}, _From, State) ->
 handle_call({prepare, Query}, _From, State) ->
     #state{socket = Socket, sockmod = SockMod} = State,
     setopts(SockMod, Socket, [{active, false}]),
-    Rec = mysql_protocol:prepare(Query, SockMod, Socket),
+    Rec = mysql_protocol:prepare(Query, SockMod, Socket, ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = #state{stmts = Stmts1} = update_state(Rec, State),
     case Rec of
@@ -437,7 +442,7 @@ handle_call({change_user, Username, Password, Options}, From,
     setopts(SockMod, Socket, [{active, false}]),
     Result = mysql_protocol:change_user(SockMod, Socket, Username, Password,
                                         AuthPluginName, AuthPluginData, Database,
-                                        ServerVersion),
+                                        ServerVersion, ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Result, State),
     State1#state.warning_count > 0 andalso State1#state.log_warnings
@@ -461,7 +466,7 @@ handle_call({change_user, Username, Password, Options}, From,
     end;
 handle_call(reset_connection, _From, #state{socket = Socket, sockmod = SockMod} = State) ->
     setopts(SockMod, Socket, [{active, false}]),
-    Result = mysql_protocol:reset_connnection(SockMod, Socket),
+    Result = mysql_protocol:reset_connnection(SockMod, Socket, ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State1 = update_state(Result, State),
     Reply = case Result of
@@ -586,7 +591,7 @@ handle_info({'DOWN', _MRef, _, Pid, _Info}, State) ->
     stop_server({application_process_died, Pid}, State);
 handle_info(ping, #state{socket = Socket, sockmod = SockMod} = State) ->
     setopts(SockMod, Socket, [{active, false}]),
-    #ok{} = mysql_protocol:ping(SockMod, Socket),
+    #ok{} = mysql_protocol:ping(SockMod, Socket, ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     {noreply, schedule_ping(State)};
 handle_info({SockClosed, _Socket}, State) when SockClosed =:= tcp_closed; SockClosed =:= ssl_closed ->
@@ -608,7 +613,7 @@ terminate(Reason, #state{socket = Socket, sockmod = SockMod})
   when Socket =/= undefined andalso (Reason == normal orelse Reason == shutdown) ->
       %% Send the goodbye message for politeness.
       setopts(SockMod, Socket, [{active, false}]),
-      mysql_protocol:quit(SockMod, Socket);
+      mysql_protocol:quit(SockMod, Socket, ?cmd_timeout);
 terminate(_Reason, _State) ->
     ok.
 
@@ -725,7 +730,7 @@ named_prepare(Name, Query, State) ->
         error ->
             State
     end,
-    Rec = mysql_protocol:prepare(Query, SockMod, Socket),
+    Rec = mysql_protocol:prepare(Query, SockMod, Socket, ?cmd_timeout),
     setopts(SockMod, Socket, [{active, once}]),
     State2 = #state{stmts = Stmts2} = update_state(Rec, State1),
     case Rec of
@@ -786,9 +791,9 @@ handle_query_call_result([Rec|Recs], RecNum, Query,
     end.
 
 %% @doc Schedules (or re-schedules) ping.
-schedule_ping(State = #state{ping_timeout = infinity}) ->
+schedule_ping(State = #state{ping_interval = infinity}) ->
     State;
-schedule_ping(State = #state{ping_timeout = Timeout, ping_ref = Ref}) ->
+schedule_ping(State = #state{ping_interval = Timeout, ping_ref = Ref}) ->
     is_reference(Ref) andalso erlang:cancel_timer(Ref),
     State#state{ping_ref = erlang:send_after(Timeout, self(), ping)}.
 
@@ -831,15 +836,15 @@ maybe_log_slow_query(_, _, _, _) ->
 %% @doc Makes a separate connection and execute KILL QUERY. We do this to get
 %% our main connection back to normal. KILL QUERY appeared in MySQL 5.0.0.
 kill_query(#state{connection_id = ConnId, host = Host, port = Port,
-                  user = User, password = Password, ssl_opts = SSLOpts,
+                  user = User, password = Password, tcp_opts = TcpOpts, ssl_opts = SSLOpts,
                   cap_found_rows = SetFoundRows}) ->
     %% Connect socket
-    SockOpts = [{active, false}, binary, {packet, raw}],
+    SockOpts = sanitize_tcp_opts(Host, TcpOpts),
     {ok, Socket0} = gen_tcp:connect(Host, Port, SockOpts),
 
     %% Exchange handshake communication.
     Result = mysql_protocol:handshake(Host, User, Password, undefined, gen_tcp,
-                                      SSLOpts, Socket0, SetFoundRows),
+                                      SSLOpts, Socket0, SetFoundRows, ?cmd_timeout),
     case Result of
         {ok, #handshake{}, SockMod, Socket} ->
             %% Kill and disconnect
@@ -849,7 +854,7 @@ kill_query(#state{connection_id = ConnId, host = Host, port = Port,
                                                  [], auto,
                                                  no_filtermap_fun,
                                                  ?cmd_timeout),
-            mysql_protocol:quit(SockMod, Socket);
+            mysql_protocol:quit(SockMod, Socket, ?cmd_timeout);
         #error{} = E ->
             logger:error("Failed to connect to kill query: ~p",
                          [error_to_reason(E)]);

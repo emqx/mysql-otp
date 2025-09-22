@@ -367,6 +367,30 @@ connect_prepare_failure_test() ->
     assert_init_exit(Reason),
     process_flag(trap_exit, false).
 
+socket_timeout_test_() ->
+    {setup,
+     fun() ->
+         application:ensure_all_started(inets),
+         reset_proxy()
+     end,
+     fun (_) ->
+         reset_proxy()
+     end,
+     fun (_) ->
+        [{"Crash by keep_alive response timeout", fun() ->
+            {ok, Pid} = mysql:start_link(
+                [{user, ?user}, {password, ?password}, {port, 33306}, {keep_alive, 500}]),
+            ?assert(mysql:is_connected(Pid)),
+            erlang:process_flag(trap_exit, true),
+            timeout_proxy_on("mysql", 300_000),
+            receive
+                {'EXIT', Pid, _Reason} -> ok
+            after 5000 ->
+                error(mysql_client_not_stopped)
+            end
+         end}]
+     end}.
+
 %% For R16B where sys:get_state/1 is not available.
 get_state(Process) ->
     {status,_,_,[_,_,_,_,Misc]} = sys:get_status(Process),
@@ -1317,3 +1341,36 @@ is_access_denied(_) ->
 
 get_socket_from_conn(Pid) ->
     element(?conn_state_socket_position, sys:get_state(Pid)).
+
+%% --- ToxiProxy ---
+
+reset_proxy() ->
+    Url = toxiproxy_base_uri() ++ "/reset",
+    Body = <<>>,
+    {ok, {{_, 204, _}, _, _}} = httpc:request(
+        post,
+        {Url, [], "application/json", Body},
+        [],
+        [{body_format, binary}]
+    ).
+
+timeout_proxy_on(Name, Timeout) ->
+    ToxicName = Name ++ "_timeout",
+    Url =
+        toxiproxy_base_uri() ++ "/proxies/" ++ Name ++
+            "/toxics",
+    BodyBin = <<"{\"name\":\"", (list_to_binary(ToxicName))/binary, "\","
+                "\"type\":\"timeout\","
+                "\"stream\":\"upstream\","
+                "\"toxicity\":1.0,"
+                "\"attributes\":{\"timeout\":", (integer_to_binary(Timeout))/binary, "}}">>,
+    {ok, {{_, 200, _}, _, _}} = httpc:request(
+        post,
+        {Url, [], "application/json", BodyBin},
+        [],
+        [{body_format, binary}]
+    ).
+
+toxiproxy_base_uri() ->
+    "http://localhost:8474".
+
